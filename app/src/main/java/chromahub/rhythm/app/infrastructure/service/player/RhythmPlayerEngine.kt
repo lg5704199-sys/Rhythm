@@ -455,9 +455,10 @@ class RhythmPlayerEngine(
             !hasActiveProcessors
 
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
-            // MOD: AC3 e E-AC3 comum nunca tocam (nem pelo hardware).
+            // MOD (teste): só o AC3 comum é bloqueado aqui. O E-AC3 fica liberado no seletor
+            // porque o ExoPlayer pode consultar "audio/eac3" como alternativa ao JOC.
             // AC-4 e E-AC3 JOC passam normalmente para o decodificador do hardware.
-            if (mimeType == MimeTypes.AUDIO_AC3 || mimeType == MimeTypes.AUDIO_E_AC3) {
+            if (mimeType == MimeTypes.AUDIO_AC3) {
                 return@MediaCodecSelector emptyList()
             }
 
@@ -603,7 +604,7 @@ class RhythmPlayerEngine(
         }
 
         val audioAttributes = AudioAttributes.Builder()
-            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setContentType(C.AUDIO_CONTENT_TYPE_UNKNOWN)
             .setUsage(C.USAGE_MEDIA)
             .build()
 
@@ -1220,7 +1221,8 @@ private class DolbyMediaCodecAudioRenderer(
         codecOperatingRate: Float
     ): MediaFormat {
         val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
-        if (codecMimeType == MimeTypes.AUDIO_E_AC3_JOC || codecMimeType == MimeTypes.AUDIO_AC4) {
+        Log.d(DOLBY_TAG, "getMediaFormat mime=$codecMimeType in=${format.sampleMimeType}")
+        if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
             try {
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
