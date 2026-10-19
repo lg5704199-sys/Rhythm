@@ -10,16 +10,28 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.MediaFormat
+import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters
+import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
@@ -28,63 +40,45 @@ import androidx.media3.exoplayer.RendererCapabilities
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.ForwardingAudioSink
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
+import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
-import chromahub.rhythm.app.core.device.HiFiCapabilityChecker
-import chromahub.rhythm.app.core.device.DeviceCapabilitiesProvider
-import androidx.media3.exoplayer.DecoderReuseEvaluation
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.datasource.ResolvingDataSource
-import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.okhttp.OkHttpDataSource
+import chromahub.rhythm.app.core.device.DeviceCapabilitiesProvider
+import chromahub.rhythm.app.core.device.HiFiCapabilityChecker
 import chromahub.rhythm.app.features.streaming.data.provider.UserTrustManager
-import java.util.concurrent.TimeUnit
-import android.os.Build
-import androidx.media3.common.TrackSelectionParameters
-import chromahub.rhythm.app.shared.data.model.AppSettings
-import android.net.Uri
 import chromahub.rhythm.app.features.streaming.di.StreamingMusicModule
-import kotlinx.coroutines.runBlocking
-import androidx.media3.datasource.cache.CacheDataSource
 import chromahub.rhythm.app.infrastructure.audio.RhythmBassBoostProcessor
-import chromahub.rhythm.app.infrastructure.audio.RhythmSpatializationProcessor
 import chromahub.rhythm.app.infrastructure.audio.RhythmMonoAudioProcessor
-import chromahub.rhythm.app.shared.data.model.TransitionSettings
+import chromahub.rhythm.app.infrastructure.audio.RhythmSpatializationProcessor
 import chromahub.rhythm.app.infrastructure.service.player.replaygain.ReplayGainAudioProcessor
 import chromahub.rhythm.app.infrastructure.service.player.replaygain.ReplayGainCache
 import chromahub.rhythm.app.infrastructure.service.player.replaygain.ReplayGainUtil
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.audio.ForwardingAudioSink
-import androidx.media3.common.audio.SonicAudioProcessor
-import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
+import chromahub.rhythm.app.shared.data.model.AppSettings
+import chromahub.rhythm.app.shared.data.model.TransitionSettings
 import chromahub.rhythm.app.util.calculateVolumeIn
 import chromahub.rhythm.app.util.calculateVolumeOut
 import chromahub.rhythm.app.util.envelope
-import kotlinx.coroutines.CoroutineScope
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import androidx.core.net.toUri
+import kotlinx.coroutines.runBlocking
 
-/**
- * MOD: valor do parâmetro vendor.dolby.active-device.value enviado ao decoder Dolby
- * (c2.dolby.eac3.decoder / c2.dolby.ac4.decoder) para ele renderizar para fone (binaural)
- * em vez de entregar os 12 canais (7.1.4) crus.
- * Valor é um chute (2 = fone). Se o channelMask no log (filtro "audiotrack") continuar
- * 0x2d63f, o valor não pegou: troque (1, 2, 3...) e teste de novo.
- */
 private const val DOLBY_ACTIVE_DEVICE = 8
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
@@ -115,7 +109,7 @@ class RhythmPlayerEngine(
 
     private lateinit var playerA: ExoPlayer
     private lateinit var playerB: ExoPlayer
-    
+
     // Player-specific child audio processors to avoid shared-state concurrency bugs in crossfades
     private var playerABassBoost: RhythmBassBoostProcessor? = null
     private var playerBBassBoost: RhythmBassBoostProcessor? = null
@@ -240,12 +234,12 @@ class RhythmPlayerEngine(
                 }
             }
         }
-        
+
         override fun onAudioSessionIdChanged(audioSessionId: Int) {
             _activeAudioSessionId.value = audioSessionId
             Log.d(TAG, "Audio session ID changed: $audioSessionId")
         }
-        
+
         override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
             Log.d(TAG, "Tracks changed")
             val format = tracks.getFirstSelectedTrackFormatByType(C.TRACK_TYPE_AUDIO) ?: (masterPlayer as? ExoPlayer)?.audioFormat
@@ -455,11 +449,28 @@ class RhythmPlayerEngine(
             !hasActiveProcessors
 
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
-            // MOD (teste): só o AC3 comum é bloqueado aqui. O E-AC3 fica liberado no seletor
-            // porque o ExoPlayer pode consultar "audio/eac3" como alternativa ao JOC.
-            // AC-4 e E-AC3 JOC passam normalmente para o decodificador do hardware.
             if (mimeType == MimeTypes.AUDIO_AC3) {
                 return@MediaCodecSelector emptyList()
+            }
+
+            if (mimeType == MimeTypes.AUDIO_E_AC3 || mimeType == MimeTypes.AUDIO_E_AC3_JOC || mimeType == MimeTypes.AUDIO_AC4) {
+                val candidates = MediaCodecUtil.getDecoderInfos(
+                    mimeType,
+                    requiresSecureDecoder,
+                    requiresTunnelingDecoder
+                )
+                val sorted = candidates.sortedByDescending { info ->
+                    val name = info.name.lowercase()
+                    when {
+                        name.contains("c2.dolby") && info.isVendor -> 3
+                        name.contains("dolby") -> 2
+                        info.isVendor -> 1
+                        else -> 0
+                    }
+                }
+                if (sorted.isNotEmpty()) {
+                    return@MediaCodecSelector sorted
+                }
             }
 
             val defaultDecoders = MediaCodecSelector.DEFAULT.getDecoderInfos(
@@ -472,17 +483,13 @@ class RhythmPlayerEngine(
 
             val filtered = if (disabled.isEmpty()) defaultDecoders else defaultDecoders.filter { it.name !in disabled }
             if (preferHw) {
-                filtered.sortedByDescending { if (DeviceCapabilitiesProvider.isLikelyHardwareDecoder(it.name)) 1 else 0 }
+                filtered.sortedByDescending { if (it.isVendor || DeviceCapabilitiesProvider.isLikelyHardwareDecoder(it.name)) 1 else 0 }
             } else {
                 filtered
             }
         }
 
         val renderersFactory = object : DefaultRenderersFactory(context) {
-            // MOD: (1) troca o renderer MediaCodec padrão por um que envia os parâmetros
-            // vendor.dolby.* ao decoder Dolby (JOC/AC-4 -> binaural);
-            // (2) o FFmpeg continua ativo para os outros formatos (FLAC, Opus, WavPack...),
-            // mas é impedido de pegar AC3, E-AC3, E-AC3 JOC e AC-4.
             override fun buildAudioRenderers(
                 context: Context,
                 extensionRendererMode: Int,
@@ -543,7 +550,7 @@ class RhythmPlayerEngine(
                 if (replayGainProcessor != null) {
                     processors.add(replayGainProcessor)
                 }
-                
+
                 val silenceSkippingProcessor = SilenceSkippingAudioProcessor(
                     /* minimumSilenceDurationUs = */ 500_000L,
                     /* silenceRetentionRatio = */ 0.2f,
@@ -595,7 +602,7 @@ class RhythmPlayerEngine(
             }
         }.apply {
             val extensionMode = if (appSettings.decoderExtensionsEnabled.value) {
-                DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+                DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
             } else {
                 DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF
             }
@@ -604,8 +611,9 @@ class RhythmPlayerEngine(
         }
 
         val audioAttributes = AudioAttributes.Builder()
-            .setContentType(C.AUDIO_CONTENT_TYPE_UNKNOWN)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
+            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_AUTO)
             .build()
 
         val okHttpClient = UserTrustManager.buildUserTrustingHttpClientBuilder()
@@ -629,7 +637,6 @@ class RhythmPlayerEngine(
                         val trackId = dataSpec.uri.lastPathSegment
                         if (!trackId.isNullOrBlank()) {
                             val repository = StreamingMusicModule.provideStreamingMusicRepository(context)
-                            // Run blocking is safe here as ExoPlayer calls resolveDataSpec on a background thread
                             val freshUrl = runBlocking { repository.getStreamingUrl(trackId) }
                             if (!freshUrl.isNullOrBlank()) {
                                 return dataSpec.buildUpon()
@@ -853,14 +860,6 @@ class RhythmPlayerEngine(
         }
     }
 
-    /**
-     * Core crossfade logic:
-     * 1. Uses pre-buffered Player B with full queue context for zero-latency start
-     * 2. Swaps player references and updates MediaSession / effects
-     * 3. Runs an equal-power or configured shaped curve fade loop
-     * 4. Pauses and resumes both players synchronously if user pauses during transition
-     * 5. Releases outgoing player and resets it fresh for subsequent transitions
-     */
     private suspend fun performOverlapTransition(settings: TransitionSettings) {
         if (playerB.mediaItemCount == 0) {
             playerA.volume = userVolume
@@ -907,7 +906,6 @@ class RhythmPlayerEngine(
         playerB = outgoingPlayer
         activeReplayGainProcessor = incomingReplayGain
 
-        // Sync ReplayGain formats for the incoming player
         val mediaIdToSync = playerA.currentMediaItem?.mediaId ?: incomingMediaId
         val cachedTags = ReplayGainCache.get(mediaIdToSync)
         if (cachedTags != null) {
@@ -1064,9 +1062,9 @@ class RhythmPlayerEngine(
             ReplayGainUtil.Mode.None
         }
         processor.setMode(mode, false)
-        processor.setReduceGain(appSettings.replayGainDrc.value) // clipping prevention (drc)
-        processor.setRgGain(appSettings.replayGainPreamp.value.toInt()) // preamp in dB
-        processor.setNonRgGain(appSettings.replayGainPreampUntagged.value.toInt()) // preamp in dB when no tag is present
+        processor.setReduceGain(appSettings.replayGainDrc.value)
+        processor.setRgGain(appSettings.replayGainPreamp.value.toInt())
+        processor.setNonRgGain(appSettings.replayGainPreampUntagged.value.toInt())
     }
 
     fun applyReplayGainSettings(enabled: Boolean) {
@@ -1088,9 +1086,6 @@ class RhythmPlayerEngine(
             return baseParameters
         }
 
-        // Software audio effects, crossfade, and variable playback rates are incompatible
-        // with hardware audio offload. If any of them is active, offload must be disabled
-        // to prevent conflicts or pitch/resampling distortions on buggy OEM DSP implementations.
         val isCrossfadeEnabled = appSettings.crossfade.value
         val isEqualizerEnabled = appSettings.equalizerEnabled.value
         val isReplayGainEnabled = appSettings.replayGain.value
@@ -1160,9 +1155,6 @@ class RhythmPlayerEngine(
     fun release() {
         setPauseAtEndOfMediaItems(false)
         transitionJob?.cancel()
-        // Cancel the engine scope so long-running StateFlow collections
-        // (e.g. appSettings.bassBoostEnabled) don't keep this engine and its
-        // service context alive after the service is destroyed.
         scope.cancel()
         abandonAudioFocus()
         if (::playerA.isInitialized) {
@@ -1191,11 +1183,6 @@ data class EngineAudioFormat(
     val timestamp: Long = System.currentTimeMillis()
 )
 
-/**
- * MOD: MediaCodecAudioRenderer que injeta os parâmetros vendor.dolby.* no MediaFormat
- * quando o decoder é E-AC3 JOC ou AC-4, para o decoder Dolby renderizar para fone
- * (binaural) em vez de devolver 7.1.4 cru.
- */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
     context: Context,
@@ -1221,12 +1208,11 @@ private class DolbyMediaCodecAudioRenderer(
         codecOperatingRate: Float
     ): MediaFormat {
         val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
-        Log.d(DOLBY_TAG, "getMediaFormat mime=$codecMimeType in=${format.sampleMimeType}")
         if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
             try {
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-                Log.d(DOLBY_TAG, "Dolby params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE")
+                Log.d(DOLBY_TAG, "Dolby vendor params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
@@ -1235,12 +1221,6 @@ private class DolbyMediaCodecAudioRenderer(
     }
 }
 
-/**
- * MOD: envolve o renderizador do FFmpeg e faz ele recusar AC3, E-AC3, E-AC3 JOC e AC-4.
- * Todo o resto (FLAC, Opus, WavPack etc.) continua sendo decodificado pelo FFmpeg normalmente.
- * AC-4 e JOC ficam livres para o MediaCodec (hardware); AC3 e E-AC3 comum são bloqueados
- * também no hardware pelo MediaCodecSelector em buildPlayer().
- */
 @OptIn(UnstableApi::class)
 private class NoDolbyRenderer(private val base: Renderer) : Renderer by base {
     override fun getCapabilities(): RendererCapabilities = NoDolbyCapabilities(base.capabilities)
@@ -1257,7 +1237,7 @@ private class NoDolbyCapabilities(private val base: RendererCapabilities) : Rend
 
     override fun supportsFormat(format: androidx.media3.common.Format): Int {
         return if (format.sampleMimeType in blockedMimeTypes) {
-            RendererCapabilities.create(C.FORMAT_UNSUPPORTED_SUBTYPE)
+            RendererCapabilities.create(C.FORMAT_UNSUPPORTED_TYPE)
         } else {
             base.supportsFormat(format)
         }
