@@ -14,14 +14,18 @@ import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.RendererCapabilities
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import chromahub.rhythm.app.core.device.HiFiCapabilityChecker
 import chromahub.rhythm.app.core.device.DeviceCapabilitiesProvider
@@ -436,6 +440,12 @@ class RhythmPlayerEngine(
             !hasActiveProcessors
 
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
+            // MOD: AC3 e E-AC3 comum nunca tocam (nem pelo hardware).
+            // AC-4 e E-AC3 JOC passam normalmente para o decodificador do hardware.
+            if (mimeType == MimeTypes.AUDIO_AC3 || mimeType == MimeTypes.AUDIO_E_AC3) {
+                return@MediaCodecSelector emptyList()
+            }
+
             val defaultDecoders = MediaCodecSelector.DEFAULT.getDecoderInfos(
                 mimeType,
                 requiresSecureDecoder,
@@ -453,6 +463,36 @@ class RhythmPlayerEngine(
         }
 
         val renderersFactory = object : DefaultRenderersFactory(context) {
+            // MOD: o FFmpeg continua ativo para os outros formatos (FLAC, Opus, WavPack...),
+            // mas é impedido de pegar AC3, E-AC3, E-AC3 JOC e AC-4.
+            override fun buildAudioRenderers(
+                context: Context,
+                extensionRendererMode: Int,
+                mediaCodecSelector: MediaCodecSelector,
+                enableDecoderFallback: Boolean,
+                audioSink: AudioSink,
+                eventHandler: android.os.Handler,
+                eventListener: AudioRendererEventListener,
+                out: ArrayList<Renderer>
+            ) {
+                super.buildAudioRenderers(
+                    context,
+                    extensionRendererMode,
+                    mediaCodecSelector,
+                    enableDecoderFallback,
+                    audioSink,
+                    eventHandler,
+                    eventListener,
+                    out
+                )
+                for (i in out.indices) {
+                    val renderer = out[i]
+                    if (renderer.javaClass.simpleName.contains("Ffmpeg", ignoreCase = true)) {
+                        out[i] = NoDolbyRenderer(renderer)
+                    }
+                }
+            }
+
             override fun buildAudioSink(
                 context: Context,
                 enableFloatOutput: Boolean,
@@ -1118,6 +1158,35 @@ data class EngineAudioFormat(
     val decoderName: String = "",
     val timestamp: Long = System.currentTimeMillis()
 )
+
+/**
+ * MOD: envolve o renderizador do FFmpeg e faz ele recusar AC3, E-AC3, E-AC3 JOC e AC-4.
+ * Todo o resto (FLAC, Opus, WavPack etc.) continua sendo decodificado pelo FFmpeg normalmente.
+ * AC-4 e JOC ficam livres para o MediaCodec (hardware); AC3 e E-AC3 comum são bloqueados
+ * também no hardware pelo MediaCodecSelector em buildPlayer().
+ */
+@OptIn(UnstableApi::class)
+private class NoDolbyRenderer(private val base: Renderer) : Renderer by base {
+    override fun getCapabilities(): RendererCapabilities = NoDolbyCapabilities(base.capabilities)
+}
+
+@OptIn(UnstableApi::class)
+private class NoDolbyCapabilities(private val base: RendererCapabilities) : RendererCapabilities by base {
+    private val blockedMimeTypes = setOf(
+        MimeTypes.AUDIO_AC3,
+        MimeTypes.AUDIO_E_AC3,
+        MimeTypes.AUDIO_E_AC3_JOC,
+        MimeTypes.AUDIO_AC4
+    )
+
+    override fun supportsFormat(format: androidx.media3.common.Format): Int {
+        return if (format.sampleMimeType in blockedMimeTypes) {
+            RendererCapabilities.create(C.FORMAT_UNSUPPORTED_SUBTYPE)
+        } else {
+            base.supportsFormat(format)
+        }
+    }
+}
 
 private fun androidx.media3.common.Tracks.getFirstSelectedTrackFormatByType(trackType: Int): androidx.media3.common.Format? {
     for (group in groups) {
