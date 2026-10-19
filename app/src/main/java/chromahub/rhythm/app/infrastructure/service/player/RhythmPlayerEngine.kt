@@ -429,9 +429,15 @@ class RhythmPlayerEngine(
         monoProcessor: RhythmMonoAudioProcessor? = null,
         replayGainProcessor: ReplayGainAudioProcessor? = null
     ): ExoPlayer {
+        // Buffers ampliados para evitar underruns no Direct HAL em decodificadores pesados (Dolby C2)
         val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(15_000, 30_000, 1_500, 2_500)
-            .setBackBuffer(10_000, false)
+            .setBufferDurationsMs(
+                /* minBufferMs = */ 30_000,
+                /* maxBufferMs = */ 60_000,
+                /* bufferForPlaybackMs = */ 1_000,
+                /* bufferForPlaybackAfterRebufferMs = */ 2_000
+            )
+            .setBackBuffer(0, false)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
@@ -450,7 +456,7 @@ class RhythmPlayerEngine(
             HiFiCapabilityChecker.isSupported() &&
             !hasActiveProcessors
 
-        // 1. MediaCodecSelector: Bloqueia AC3 e seleciona o descodificador proprietário da Dolby da Samsung
+        // 1. MediaCodecSelector: Bloqueia AC3 e prioriza descodificadores oficiais da Dolby (Samsung C2)
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
             if (mimeType == MimeTypes.AUDIO_AC3) {
                 return@MediaCodecSelector emptyList()
@@ -491,7 +497,7 @@ class RhythmPlayerEngine(
             }
         }
 
-        // 2. RenderersFactory: Prioridade ao MediaCodec e injeção do renderer binaural da Dolby
+        // 2. RenderersFactory: Prioridade ao MediaCodec com injeção de parâmetros Dolby e bloqueio de FFmpeg para Atmos
         val renderersFactory = object : DefaultRenderersFactory(context) {
             override fun buildAudioRenderers(
                 context: Context,
@@ -730,10 +736,6 @@ class RhythmPlayerEngine(
     /**
      * Pre-buffers the next track on Player B.
      * Sets volume to 0 and pauses, ready for the crossfade transition.
-     *
-     * When [fullQueue] is supplied, sets the complete queue on Player B with [targetIndex]
-     * so Player B has 100% of the queue context in advance, eliminating timeline manipulation
-     * latency during the transition and preventing history loss on interruption.
      */
     fun prepareNext(
         mediaItem: MediaItem,
@@ -742,6 +744,14 @@ class RhythmPlayerEngine(
         shuffleIndices: IntArray? = null,
         startPositionMs: Long = 0L
     ) {
+        // Bloqueia a inicialização paralela pesada do playerB se estiver a reproduzir E-AC-3 ou AC-4,
+        // eliminando a contenção de memória/DSP e prevenindo underruns antes do término da faixa.
+        val currentMime = (playerA as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty()
+        if (currentMime.contains("eac3") || currentMime.contains("ac4")) {
+            Log.d(TAG, "prepareNext ignorado: preservando fluxo contínuo em formato Dolby Atmos")
+            return
+        }
+
         try {
             Log.d(TAG, "prepareNext called for ${mediaItem.mediaId} (targetIndex=$targetIndex, queueSize=${fullQueue?.size ?: 1})")
             ReplayGainCache.get(mediaItem.mediaId)?.let { cachedInfo ->
@@ -1190,6 +1200,7 @@ data class EngineAudioFormat(
 /**
  * Renderizador MediaCodec que força a saída do descodificador da Dolby (E-AC-3 JOC / AC-4)
  * a realizar o downmix binaural internamente para auscultadores (2 canais estéreo) através do motor DAX.
+ * Implementa também canKeepCodec para reaproveitamento direto de instância em reprodução contínua.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1209,6 +1220,27 @@ private class DolbyMediaCodecAudioRenderer(
     eventListener,
     audioSink
 ) {
+    override fun canKeepCodec(
+        codecInfo: androidx.media3.exoplayer.mediacodec.MediaCodecInfo,
+        oldFormat: androidx.media3.common.Format,
+        newFormat: androidx.media3.common.Format
+    ): DecoderReuseEvaluation {
+        // Se a faixa seguinte mantiver o mesmo formato (E-AC-3 para E-AC-3 ou AC-4 para AC-4),
+        // reaproveita a mesma instância sem recriar o descodificador no hardware.
+        if (oldFormat.sampleMimeType == newFormat.sampleMimeType &&
+            (oldFormat.sampleMimeType?.contains("eac3") == true || oldFormat.sampleMimeType?.contains("ac4") == true)
+        ) {
+            return DecoderReuseEvaluation(
+                codecInfo.name,
+                oldFormat,
+                newFormat,
+                DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION,
+                0
+            )
+        }
+        return super.canKeepCodec(codecInfo, oldFormat, newFormat)
+    }
+
     override fun getMediaFormat(
         format: androidx.media3.common.Format,
         codecMimeType: String,
