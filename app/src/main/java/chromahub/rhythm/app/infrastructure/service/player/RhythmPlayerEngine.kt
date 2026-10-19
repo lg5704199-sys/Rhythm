@@ -85,7 +85,7 @@ import androidx.core.net.toUri
  * Valor é um chute (2 = fone). Se o channelMask no log (filtro "audiotrack") continuar
  * 0x2d63f, o valor não pegou: troque (1, 2, 3...) e teste de novo.
  */
-private const val DOLBY_ACTIVE_DEVICE = 2
+private const val DOLBY_ACTIVE_DEVICE = 8
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
 
