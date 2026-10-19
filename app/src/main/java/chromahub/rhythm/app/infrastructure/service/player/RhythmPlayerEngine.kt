@@ -447,7 +447,7 @@ class RhythmPlayerEngine(
         val floatOutputPref = appSettings.audioEngineFloatOutput.value &&
             HiFiCapabilityChecker.isSupported() &&
             !hasActiveProcessors
-
+        
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
             if (mimeType == MimeTypes.AUDIO_AC3) {
                 return@MediaCodecSelector emptyList()
@@ -462,9 +462,8 @@ class RhythmPlayerEngine(
                 val sorted = candidates.sortedByDescending { info ->
                     val name = info.name.lowercase()
                     when {
-                        name.contains("c2.dolby") && info.isVendor -> 3
+                        name.contains("c2.dolby") -> 3
                         name.contains("dolby") -> 2
-                        info.isVendor -> 1
                         else -> 0
                     }
                 }
@@ -483,11 +482,12 @@ class RhythmPlayerEngine(
 
             val filtered = if (disabled.isEmpty()) defaultDecoders else defaultDecoders.filter { it.name !in disabled }
             if (preferHw) {
-                filtered.sortedByDescending { if (it.isVendor || DeviceCapabilitiesProvider.isLikelyHardwareDecoder(it.name)) 1 else 0 }
+                filtered.sortedByDescending { if (DeviceCapabilitiesProvider.isLikelyHardwareDecoder(it.name)) 1 else 0 }
             } else {
                 filtered
             }
         }
+        
 
         val renderersFactory = object : DefaultRenderersFactory(context) {
             override fun buildAudioRenderers(
