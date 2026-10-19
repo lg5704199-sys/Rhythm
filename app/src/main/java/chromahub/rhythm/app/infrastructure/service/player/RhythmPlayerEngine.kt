@@ -79,7 +79,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-private const val DOLBY_ACTIVE_DEVICE = 2 // 2 = Auscultadores (Headphones)
+// Parâmetros proprietários da Dolby no Android C2
+// 2 = Auscultadores (Headphones); 1 = DAX State ativo para renderização binaural
+private const val DOLBY_ACTIVE_DEVICE = 2
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
 
@@ -447,7 +449,8 @@ class RhythmPlayerEngine(
         val floatOutputPref = appSettings.audioEngineFloatOutput.value &&
             HiFiCapabilityChecker.isSupported() &&
             !hasActiveProcessors
-        
+
+        // 1. MediaCodecSelector: Bloqueia AC3 e seleciona o descodificador proprietário da Dolby da Samsung
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
             if (mimeType == MimeTypes.AUDIO_AC3) {
                 return@MediaCodecSelector emptyList()
@@ -487,8 +490,8 @@ class RhythmPlayerEngine(
                 filtered
             }
         }
-        
 
+        // 2. RenderersFactory: Prioridade ao MediaCodec e injeção do renderer binaural da Dolby
         val renderersFactory = object : DefaultRenderersFactory(context) {
             override fun buildAudioRenderers(
                 context: Context,
@@ -610,6 +613,7 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
+        // 3. AudioAttributes: Configura o uso musical para permitir espacialização
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
@@ -1183,6 +1187,10 @@ data class EngineAudioFormat(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+/**
+ * Renderizador MediaCodec que força a saída do descodificador da Dolby (E-AC-3 JOC / AC-4)
+ * a realizar o downmix binaural internamente para auscultadores (2 canais estéreo) através do motor DAX.
+ */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
     context: Context,
@@ -1210,11 +1218,14 @@ private class DolbyMediaCodecAudioRenderer(
         val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
         if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
             try {
-                // Força o descodificador da Dolby a aplicar a virtualização binaural interna para 2 canais
-                mediaFormat.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 2)
+                // Força o descodificador da Dolby a limitar a saída a 2 canais binaurais
+                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
+                mediaFormat.setInteger("max-output-channel-count", 2)
+
+                // Parâmetros de fornecedor para auscultadores e ativação do motor DAX
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-                Log.d(DOLBY_TAG, "Dolby vendor params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE channels=2")
+                Log.d(DOLBY_TAG, "Dolby vendor params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE maxChannels=2")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
@@ -1222,6 +1233,11 @@ private class DolbyMediaCodecAudioRenderer(
         return mediaFormat
     }
 }
+
+/**
+ * Envolve o renderizador do FFmpeg e rejeita categoricamente AC3, E-AC3, E-AC3 JOC e AC-4.
+ * Formatos como FLAC, Opus, ALAC, WavPack etc. continuam a funcionar normalmente.
+ */
 @OptIn(UnstableApi::class)
 private class NoDolbyRenderer(private val base: Renderer) : Renderer by base {
     override fun getCapabilities(): RendererCapabilities = NoDolbyCapabilities(base.capabilities)
