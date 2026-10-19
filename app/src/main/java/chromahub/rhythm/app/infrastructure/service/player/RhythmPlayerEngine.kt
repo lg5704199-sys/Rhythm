@@ -79,7 +79,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-private const val DOLBY_ACTIVE_DEVICE = 8
+private const val DOLBY_ACTIVE_DEVICE = 2 // 2 = Auscultadores (Headphones)
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
 
@@ -1210,9 +1210,11 @@ private class DolbyMediaCodecAudioRenderer(
         val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
         if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
             try {
+                // Força o descodificador da Dolby a aplicar a virtualização binaural interna para 2 canais
+                mediaFormat.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-                Log.d(DOLBY_TAG, "Dolby vendor params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE")
+                Log.d(DOLBY_TAG, "Dolby vendor params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE channels=2")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
@@ -1220,7 +1222,6 @@ private class DolbyMediaCodecAudioRenderer(
         return mediaFormat
     }
 }
-
 @OptIn(UnstableApi::class)
 private class NoDolbyRenderer(private val base: Renderer) : Renderer by base {
     override fun getCapabilities(): RendererCapabilities = NoDolbyCapabilities(base.capabilities)
