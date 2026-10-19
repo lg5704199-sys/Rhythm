@@ -9,6 +9,8 @@ import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaFormat
+import android.os.Handler
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -26,6 +28,8 @@ import androidx.media3.exoplayer.RendererCapabilities
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
+import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
+import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import chromahub.rhythm.app.core.device.HiFiCapabilityChecker
 import chromahub.rhythm.app.core.device.DeviceCapabilitiesProvider
@@ -73,6 +77,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import androidx.core.net.toUri
+
+/**
+ * MOD: valor do parâmetro vendor.dolby.active-device.value enviado ao decoder Dolby
+ * (c2.dolby.eac3.decoder / c2.dolby.ac4.decoder) para ele renderizar para fone (binaural)
+ * em vez de entregar os 12 canais (7.1.4) crus.
+ * Valor é um chute (2 = fone). Se o channelMask no log (filtro "audiotrack") continuar
+ * 0x2d63f, o valor não pegou: troque (1, 2, 3...) e teste de novo.
+ */
+private const val DOLBY_ACTIVE_DEVICE = 2
+private const val DOLBY_DAX_STATE = 1
+private const val DOLBY_TAG = "RhythmDolby"
 
 /**
  * Manages two ExoPlayer instances (A and B) to enable seamless crossfade transitions.
@@ -463,7 +478,9 @@ class RhythmPlayerEngine(
         }
 
         val renderersFactory = object : DefaultRenderersFactory(context) {
-            // MOD: o FFmpeg continua ativo para os outros formatos (FLAC, Opus, WavPack...),
+            // MOD: (1) troca o renderer MediaCodec padrão por um que envia os parâmetros
+            // vendor.dolby.* ao decoder Dolby (JOC/AC-4 -> binaural);
+            // (2) o FFmpeg continua ativo para os outros formatos (FLAC, Opus, WavPack...),
             // mas é impedido de pegar AC3, E-AC3, E-AC3 JOC e AC-4.
             override fun buildAudioRenderers(
                 context: Context,
@@ -471,7 +488,7 @@ class RhythmPlayerEngine(
                 mediaCodecSelector: MediaCodecSelector,
                 enableDecoderFallback: Boolean,
                 audioSink: AudioSink,
-                eventHandler: android.os.Handler,
+                eventHandler: Handler,
                 eventListener: AudioRendererEventListener,
                 out: ArrayList<Renderer>
             ) {
@@ -485,6 +502,20 @@ class RhythmPlayerEngine(
                     eventListener,
                     out
                 )
+
+                val mcIndex = out.indexOfFirst { it is MediaCodecAudioRenderer }
+                if (mcIndex >= 0) {
+                    out[mcIndex] = DolbyMediaCodecAudioRenderer(
+                        context,
+                        MediaCodecAdapter.Factory.getDefault(context),
+                        mediaCodecSelector,
+                        enableDecoderFallback,
+                        eventHandler,
+                        eventListener,
+                        audioSink
+                    )
+                }
+
                 for (i in out.indices) {
                     val renderer = out[i]
                     if (renderer.javaClass.simpleName.contains("Ffmpeg", ignoreCase = true)) {
@@ -1158,6 +1189,49 @@ data class EngineAudioFormat(
     val decoderName: String = "",
     val timestamp: Long = System.currentTimeMillis()
 )
+
+/**
+ * MOD: MediaCodecAudioRenderer que injeta os parâmetros vendor.dolby.* no MediaFormat
+ * quando o decoder é E-AC3 JOC ou AC-4, para o decoder Dolby renderizar para fone
+ * (binaural) em vez de devolver 7.1.4 cru.
+ */
+@OptIn(UnstableApi::class)
+private class DolbyMediaCodecAudioRenderer(
+    context: Context,
+    codecAdapterFactory: MediaCodecAdapter.Factory,
+    mediaCodecSelector: MediaCodecSelector,
+    enableDecoderFallback: Boolean,
+    eventHandler: Handler?,
+    eventListener: AudioRendererEventListener?,
+    audioSink: AudioSink
+) : MediaCodecAudioRenderer(
+    context,
+    codecAdapterFactory,
+    mediaCodecSelector,
+    enableDecoderFallback,
+    eventHandler,
+    eventListener,
+    audioSink
+) {
+    override fun getMediaFormat(
+        format: androidx.media3.common.Format,
+        codecMimeType: String,
+        codecMaxInputSize: Int,
+        codecOperatingRate: Float
+    ): MediaFormat {
+        val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
+        if (codecMimeType == MimeTypes.AUDIO_E_AC3_JOC || codecMimeType == MimeTypes.AUDIO_AC4) {
+            try {
+                mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
+                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
+                Log.d(DOLBY_TAG, "Dolby params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE")
+            } catch (e: Exception) {
+                Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
+            }
+        }
+        return mediaFormat
+    }
+}
 
 /**
  * MOD: envolve o renderizador do FFmpeg e faz ele recusar AC3, E-AC3, E-AC3 JOC e AC-4.
