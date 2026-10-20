@@ -93,17 +93,8 @@ android {
         }
     }
 
-    val signingProperties = getProperties(".config/keystore.properties")
-    val releaseSigning = if (signingProperties != null) {
-        signingConfigs.create("release") {
-            keyAlias = signingProperties.property("key_alias")
-            keyPassword = signingProperties.property("key_password")
-            storePassword = signingProperties.property("store_password")
-            storeFile = rootProject.file(signingProperties.property("store_file"))
-        }
-    } else {
-        signingConfigs.getByName("debug")
-    }
+    // Assinatura com a chave padrão (debug) para compilar sem erros de keystore
+    val releaseSigning = signingConfigs.getByName("debug")
 
     defaultConfig {
     }
