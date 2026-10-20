@@ -51,7 +51,6 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
-import androidx.media3.extractor.flac.FlacExtractor
 import androidx.media3.extractor.mp3.Mp3Extractor
 import androidx.media3.extractor.ts.AdtsExtractor
 import chromahub.rhythm.app.core.device.DeviceCapabilitiesProvider
@@ -232,7 +231,7 @@ class RhythmPlayerEngine(
                 if (transitionRunning && ::playerB.isInitialized) {
                     playerB.playWhenReady = false
                 }
-                // Libera a fila e buffers do Player B imediatamente ao pausar para poupar RAM
+                // Liberta buffers e fila do Player B imediatamente ao pausar para poupar RAM
                 if (::playerB.isInitialized && !transitionRunning) {
                     playerB.stop()
                     playerB.clearMediaItems()
@@ -259,7 +258,6 @@ class RhythmPlayerEngine(
                 activeDolbyGainProcessor?.isDolbyAtmos = isDolby
 
                 if (isDolby) {
-                    // Ignora ReplayGain em faixas Atmos para preservar a decodificação de objetos
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
                 } else {
                     val info = ReplayGainUtil.parse(format)
@@ -464,7 +462,6 @@ class RhythmPlayerEngine(
         replayGainProcessor: ReplayGainAudioProcessor? = null,
         dolbyGainProcessor: DolbyGainAudioProcessor? = null
     ): ExoPlayer {
-        // Otimização extrema de memória: buffers compactos para evitar retenção desnecessária na RAM do A05s
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 10_000,
@@ -608,7 +605,8 @@ class RhythmPlayerEngine(
                 val sonicAudioProcessor = SonicAudioProcessor()
                 val allProcessors: Array<AudioProcessor> =
                     (listOf(silenceSkippingProcessor) + processors + sonicAudioProcessor).toTypedArray()
-                val processorChain = object : androidx.media3.exoplayer.audio.AudioProcessorChain {
+
+                val processorChain = object : DefaultAudioSink.AudioProcessorChain {
                     override fun getAudioProcessors(): Array<AudioProcessor> = allProcessors
 
                     override fun applyPlaybackParameters(playbackParameters: PlaybackParameters): PlaybackParameters {
@@ -688,13 +686,11 @@ class RhythmPlayerEngine(
             }
         )
 
-        // Fábrica de extratores com tolerância a falhas e controle de tempo forçado
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
             .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING)
             .setAdtsExtractorFlags(AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING)
-            .setFlacExtractorFlags(FlacExtractor.FLAG_DISABLE_ID3_METADATA)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
             .setDataSourceFactory(resolvingDataSourceFactory)
@@ -1236,10 +1232,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         val out = replaceOutputBuffer(remaining)
 
         if (!isDolbyAtmos) {
-            // Cópia direta e instantânea em memória para arquivos comuns (FLAC, MP3, ALAC, WAV)
             out.put(inputBuffer)
         } else {
-            // Atenuação de -4 dB apenas em faixas Atmos para blindar contra clipping e anular os -14 dB da Samsung
             while (inputBuffer.hasRemaining()) {
                 val sample = inputBuffer.short
                 val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
@@ -1260,8 +1254,8 @@ private class DolbyMediaCodecAudioRenderer(
     codecAdapterFactory: MediaCodecAdapter.Factory,
     mediaCodecSelector: MediaCodecSelector,
     enableDecoderFallback: Boolean,
-    eventHandler: Handler?,
-    eventListener: AudioRendererEventListener?,
+    eventHandler: Handler,
+    eventListener: AudioRendererEventListener,
     audioSink: AudioSink,
     private val dolbyGainProcessor: DolbyGainAudioProcessor?
 ) : MediaCodecAudioRenderer(
@@ -1283,18 +1277,11 @@ private class DolbyMediaCodecAudioRenderer(
         if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // 1. Limita a saída a 2 canais para acionar a binauralização interna no chip da Dolby
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
-
-                // 2. Parâmetros proprietários da Dolby (2 = Auscultadores, 1 = DAX Ativo)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-
-                // 3. Normalização estrita da Dolby a -18 LKFS / LUFS (padrão de estúdio)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
-
-                // 4. Desativa o compressor dinâmico interno da Dolby que causa o efeito de bombeamento
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
 
