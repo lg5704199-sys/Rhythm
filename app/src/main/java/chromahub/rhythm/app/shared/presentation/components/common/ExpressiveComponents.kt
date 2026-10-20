@@ -6,6 +6,7 @@
 @file:OptIn(ExperimentalMaterial3ExpressiveApi::class)
 
 package chromahub.rhythm.app.shared.presentation.components.common
+import androidx.media3.common.Player
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonColors
 import androidx.compose.material3.IconButtonDefaults
@@ -1874,8 +1875,8 @@ fun ExpressiveToggleButtonGroup(
             isActive = repeatMode != 0,
             onClick = onToggleRepeat,
             icon = when (repeatMode) {
-                1 -> RhythmIcons.RepeatOne
-                2 -> RhythmIcons.Repeat
+                Player.REPEAT_MODE_ONE -> RhythmIcons.RepeatOne
+                Player.REPEAT_MODE_ALL -> RhythmIcons.Repeat
                 else -> RhythmIcons.Repeat
             },
             label = stringResource(R.string.player_chip_repeat),

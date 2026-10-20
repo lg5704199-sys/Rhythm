@@ -30,6 +30,8 @@ import java.io.File
 import androidx.core.net.toUri
 import androidx.core.content.edit
 import chromahub.rhythm.app.infrastructure.provider.RhythmAlbumArtProvider
+import chromahub.rhythm.app.util.StoragePathUtils
+import java.util.Locale
 
 /**
  * Centralized, High-Performance Media Scanning Engine for Rhythm.
@@ -159,6 +161,8 @@ class MediaScanEngine(
                 val colAlbumArtist = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM_ARTIST)
                 val colDiscNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) cursor.getColumnIndex(MediaStore.Audio.Media.DISC_NUMBER) else -1
                 val colCdTrackNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) cursor.getColumnIndex(MediaStore.Audio.Media.CD_TRACK_NUMBER) else -1
+                val colRelPath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH) else -1
+                val colDispName = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
 
             var processed = 0
             var lastProgressEmitTime = 0L
@@ -168,30 +172,44 @@ class MediaScanEngine(
                     val id = cursor.getLong(colId).toString()
                     if (seenIds.contains(id) || blacklistedSongs.contains(id)) continue
 
-                    val path = if (colData >= 0) cursor.getString(colData) else null
-                    val normPath = path?.let { StableDateAddedResolver.normalizePath(it) }
-                    if (path != null && normPath != null) {
+                    var path = if (colData >= 0) cursor.getString(colData) else null
+                    if (path.isNullOrBlank() && colRelPath >= 0 && colDispName >= 0) {
+                        val rel = cursor.getString(colRelPath)
+                        val disp = cursor.getString(colDispName)
+                        if (!rel.isNullOrBlank() && !disp.isNullOrBlank()) {
+                            val extStorage = android.os.Environment.getExternalStorageDirectory().absolutePath
+                            path = "$extStorage/$rel$disp"
+                        }
+                    }
+                    val normPath = path?.let { StoragePathUtils.sanitizeAndNormalizePath(it) }
+                    if (!normPath.isNullOrBlank()) {
                         if (seenPaths.contains(normPath)) continue
 
                         if (allowedFormats != null) {
-                            val ext = path.substringAfterLast('.', "").lowercase()
+                            val ext = normPath.substringAfterLast('.', "").lowercase(Locale.ROOT)
                             if (ext.isNotEmpty() && !allowedFormats.contains(ext)) continue
                         }
 
                         if (mediaScanMode == MediaScanMode.WHITELIST) {
                             val isFolderWhitelisted = whitelistedFolders.isNotEmpty() &&
-                                whitelistedFolders.any { normPath.startsWith(it.lowercase()) }
+                                StoragePathUtils.isPathInFolders(normPath, whitelistedFolders)
                             val isSongWhitelisted = whitelistedSongs.isNotEmpty() &&
                                 whitelistedSongs.contains(id)
                             if (!isFolderWhitelisted && !isSongWhitelisted) continue
                         }
 
                         if (mediaScanMode == MediaScanMode.BLACKLIST && blacklistedFolders.isNotEmpty()) {
-                            val isBlacklisted = blacklistedFolders.any { normPath.startsWith(it.lowercase()) }
+                            val isBlacklisted = StoragePathUtils.isPathInFolders(normPath, blacklistedFolders)
                             if (isBlacklisted) continue
                         }
 
                         seenPaths.add(normPath)
+                    } else {
+                        if (mediaScanMode == MediaScanMode.WHITELIST) {
+                            val isSongWhitelisted = whitelistedSongs.isNotEmpty() &&
+                                whitelistedSongs.contains(id)
+                            if (!isSongWhitelisted) continue
+                        }
                     }
 
                     val duration = cursor.getLong(colDuration)
@@ -394,6 +412,18 @@ class MediaScanEngine(
                 }
             }
 
+            if (mediaScanMode == MediaScanMode.WHITELIST && whitelistedFolders.isNotEmpty()) {
+                val unindexedSongs = scanWhitelistedFoldersOnDisk(
+                    whitelistedFolders = whitelistedFolders,
+                    seenPaths = seenPaths,
+                    seenIds = seenIds,
+                    allowedFormats = allowedFormats,
+                    minimumDuration = minimumDuration,
+                    includeHiddenWhitelistedMedia = appSettings.includeHiddenWhitelistedMedia.value
+                )
+                scannedSongs.addAll(unindexedSongs)
+            }
+
             dateAddedResolver.flush()
 
             // Sync with Room DB atomically
@@ -460,5 +490,237 @@ class MediaScanEngine(
             _scanProgress.value = ScanProgress(0, 0, ScanPhase.Error, 0)
             emptyList()
         }
+    }
+
+    private fun scanWhitelistedFoldersOnDisk(
+        whitelistedFolders: List<String>,
+        seenPaths: MutableSet<String>,
+        seenIds: MutableSet<String>,
+        allowedFormats: Set<String>?,
+        minimumDuration: Long,
+        includeHiddenWhitelistedMedia: Boolean
+    ): List<SongEntity> {
+        val discovered = mutableListOf<SongEntity>()
+        val defaultAudioExtensions = setOf(
+            "mp3", "m4a", "flac", "ogg", "opus", "opa", "wav", "aac", "alac", "aiff", "aif", "wma", "mka",
+            "ac3", "ac4", "oga", "mid", "midi", "adts", "m4b"
+        )
+        val preferSongArtwork = appSettings.preferSongArtwork.value
+        val losslessArtwork = appSettings.isLosslessArtworkActive.value
+
+        for (folderPath in whitelistedFolders) {
+            val root = File(folderPath)
+            if (!root.exists() || !root.isDirectory) {
+                continue
+            }
+
+            try {
+                root.walkTopDown()
+                    .onEnter { dir ->
+                        if (!includeHiddenWhitelistedMedia && dir.name.startsWith(".")) {
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    .forEach { file ->
+                        if (!file.isFile) return@forEach
+                        if (!includeHiddenWhitelistedMedia && file.name.startsWith(".")) return@forEach
+
+                        val ext = file.extension.lowercase(Locale.ROOT)
+                        val isSupported = if (allowedFormats != null) {
+                            allowedFormats.contains(ext)
+                        } else {
+                            defaultAudioExtensions.contains(ext)
+                        }
+                        if (!isSupported) return@forEach
+
+                        val absolutePath = file.absolutePath
+                        val normPath = StoragePathUtils.sanitizeAndNormalizePath(absolutePath)
+                        if (seenPaths.contains(normPath)) return@forEach
+
+                        val existing = dateAddedResolver.findExistingByPath(normPath)
+                        val fileId = "file_${normPath.hashCode()}"
+
+                        if (existing != null && file.lastModified() == existing.dateModified && existing.duration >= minimumDuration) {
+                            val resolvedId = existing.id.ifEmpty { fileId }
+                            discovered.add(existing.copy(id = resolvedId))
+                            seenPaths.add(normPath)
+                            seenIds.add(resolvedId)
+                            return@forEach
+                        }
+
+                        val entity = createSongEntityFromFile(file, fileId, preferSongArtwork, losslessArtwork, minimumDuration)
+                        if (entity != null) {
+                            discovered.add(entity)
+                            seenPaths.add(normPath)
+                            seenIds.add(fileId)
+
+                            try {
+                                android.media.MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
+                            } catch (_: Exception) {}
+                        }
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error scanning whitelisted folder on disk: $folderPath", e)
+            }
+        }
+
+        if (discovered.isNotEmpty()) {
+            Log.d(TAG, "Added ${discovered.size} songs from direct whitelisted folders scan")
+        }
+        return discovered
+    }
+
+    private fun createSongEntityFromFile(
+        file: File,
+        id: String,
+        preferSongArtwork: Boolean,
+        losslessArtwork: Boolean,
+        minimumDuration: Long
+    ): SongEntity? {
+        var title = file.nameWithoutExtension
+        var artist = "Unknown Artist"
+        var album = "Unknown Album"
+        var albumArtist: String? = null
+        var genre: String? = null
+        var duration = 0L
+        var year = 0
+        var trackNumber = 0
+        var discNumber = 1
+
+        try {
+            android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                val metadata = com.kyant.taglib.TagLib.getMetadata(fd.detachFd())
+                val propertyMap = metadata?.propertyMap ?: emptyMap()
+
+                propertyMap["TITLE"]?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    title = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                }
+                propertyMap["ARTIST"]?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    artist = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                }
+                propertyMap["ALBUM"]?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    album = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                }
+                (propertyMap["ALBUMARTIST"] ?: propertyMap["ALBUM ARTIST"] ?: propertyMap["ALBUM_ARTIST"])?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    albumArtist = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                }
+                propertyMap["GENRE"]?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    genre = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                }
+                val dateValues = propertyMap["DATE"] ?: propertyMap["YEAR"]
+                if (!dateValues.isNullOrEmpty() && dateValues[0].isNotBlank()) {
+                    year = chromahub.rhythm.app.util.MetadataHeuristics.parseYear(dateValues[0])
+                }
+                val trackValues = propertyMap["TRACKNUMBER"]
+                if (!trackValues.isNullOrEmpty() && trackValues[0].isNotBlank()) {
+                    val parsed = trackValues[0].substringBefore('/').toIntOrNull() ?: 0
+                    if (parsed >= 1000) {
+                        discNumber = parsed / 1000
+                        trackNumber = parsed % 1000
+                    } else if (parsed > 0) {
+                        trackNumber = parsed
+                    }
+                }
+                val discValues = propertyMap["DISCNUMBER"]
+                if (!discValues.isNullOrEmpty() && discValues[0].isNotBlank()) {
+                    val parsedDisc = discValues[0].substringBefore('/').toIntOrNull() ?: 1
+                    if (parsedDisc > 0) discNumber = parsedDisc
+                }
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            val retriever = android.media.MediaMetadataRetriever()
+            retriever.setDataSource(file.absolutePath)
+            try {
+                if (duration <= 0L) {
+                    duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                }
+                if (title == file.nameWithoutExtension) {
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_TITLE)?.trim()?.let {
+                        if (it.isNotBlank()) title = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                    }
+                }
+                if (artist == "Unknown Artist") {
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ARTIST)?.trim()?.let {
+                        if (it.isNotBlank()) artist = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                    }
+                }
+                if (album == "Unknown Album") {
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ALBUM)?.trim()?.let {
+                        if (it.isNotBlank()) album = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                    }
+                }
+                if (albumArtist.isNullOrBlank()) {
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST)?.trim()?.let {
+                        if (it.isNotBlank()) albumArtist = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                    }
+                }
+                if (genre.isNullOrBlank()) {
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_GENRE)?.trim()?.let {
+                        if (it.isNotBlank()) genre = chromahub.rhythm.app.util.MetadataHeuristics.normalizeMetadataText(it) ?: it
+                    }
+                }
+                if (year == 0) {
+                    year = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_YEAR)?.toIntOrNull() ?: 0
+                }
+            } finally {
+                try { retriever.release() } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+
+        if (minimumDuration > 0 && duration < minimumDuration) return null
+        if (duration <= 0L) {
+            duration = 180_000L
+        }
+
+        val fileUri = Uri.fromFile(file).toString()
+        val artworkUri = if (preferSongArtwork) {
+            RhythmAlbumArtProvider.buildSongUri(
+                id = id,
+                path = file.absolutePath,
+                albumId = "album_$id",
+                lossless = losslessArtwork
+            ).toString()
+        } else {
+            null
+        }
+
+        val now = System.currentTimeMillis()
+        val dateAdded = dateAddedResolver.resolveDateAdded(
+            songId = id,
+            filePath = file.absolutePath,
+            title = title,
+            artist = artist,
+            album = album,
+            durationMs = duration,
+            observedDateAddedMs = file.lastModified().takeIf { it > 0 } ?: now
+        )
+        val dateModified = file.lastModified().takeIf { it > 0 } ?: dateAdded
+
+        return SongEntity(
+            id = id,
+            title = title,
+            artist = artist,
+            album = album,
+            albumId = "album_$id",
+            duration = duration,
+            uri = fileUri,
+            artworkUri = artworkUri,
+            trackNumber = trackNumber,
+            year = year,
+            genre = genre,
+            dateAdded = dateAdded,
+            dateModified = dateModified,
+            albumArtist = albumArtist,
+            bitrate = null,
+            sampleRate = null,
+            channels = null,
+            codec = file.extension.uppercase(Locale.ROOT),
+            discNumber = discNumber,
+            path = file.absolutePath
+        )
     }
 }

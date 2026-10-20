@@ -294,6 +294,9 @@
     <string name="settings_add_folder_button">Add Folder</string>
     <string name="settings_clear_all_button_short">Clear All</string>
     <string name="settings_root">Root</string>
+    <string name="folder_blocked_success">Blocked folder: %1$s</string>
+    <string name="folder_whitelisted_success">Whitelisted folder: %1$s</string>
+    <string name="error_folder_add_failed">Could not resolve folder path. Please select a valid folder.</string>
     <string name="settings_scan_behavior">Scan Behavior</string>
     <string name="settings_include_hidden_whitelisted_media">Include Hidden &amp; .nomedia Files</string>
     <string name="settings_include_hidden_whitelisted_media_desc">Scan hidden and .nomedia audio paths during media scans.</string>

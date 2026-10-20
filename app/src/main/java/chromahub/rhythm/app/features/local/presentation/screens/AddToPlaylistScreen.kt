@@ -281,7 +281,7 @@ fun AddToPlaylistScreen(
                     // Song items
                     itemsIndexed(
                         items = filteredSongs,
-                        key = { index, song -> "addsong_${song.id}_$index" }
+                        key = { _, song -> "addsong_${song.id}" }
                     ) { index, song ->
                         SongSelectionItem(
                             song = song,
@@ -336,7 +336,6 @@ private fun SongSelectionItem(
     )
     
     Surface(
-        onClick = onSongClick,
         modifier = modifier
             .fillMaxWidth()
             .graphicsLayer {

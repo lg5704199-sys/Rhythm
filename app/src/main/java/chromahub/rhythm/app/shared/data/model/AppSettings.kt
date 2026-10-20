@@ -21,6 +21,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import chromahub.rhythm.app.util.GsonUtils
 import chromahub.rhythm.app.util.ArtistSeparator
+import chromahub.rhythm.app.util.StoragePathUtils
 import chromahub.rhythm.app.worker.BackupWorker
 import chromahub.rhythm.app.worker.RhythmPulseNotificationWorker
 import chromahub.rhythm.app.worker.UpdateNotificationWorker
@@ -1311,7 +1312,7 @@ class AppSettings private constructor(context: Context) {
     private val _savedShuffleState = MutableStateFlow(prefs.getBoolean(KEY_SAVED_SHUFFLE_STATE, false))
     val savedShuffleState: StateFlow<Boolean> = _savedShuffleState.asStateFlow()
     
-    private val _savedRepeatMode = MutableStateFlow(prefs.getInt(KEY_SAVED_REPEAT_MODE, 0)) // 0 = OFF, 1 = ALL, 2 = ONE
+    private val _savedRepeatMode = MutableStateFlow(prefs.getInt(KEY_SAVED_REPEAT_MODE, 0))
     val savedRepeatMode: StateFlow<Int> = _savedRepeatMode.asStateFlow()
     
     private val _playbackSpeed = MutableStateFlow(prefs.getFloat(KEY_PLAYBACK_SPEED, 1.0f))
@@ -2139,7 +2140,12 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
         try {
             val json = prefs.getString(KEY_BLACKLISTED_FOLDERS, null)
             if (json != null) {
-                Gson().fromJson(json, object : TypeToken<List<String>>() {}.type)
+                val rawList: List<String> = Gson().fromJson(json, object : TypeToken<List<String>>() {}.type) ?: emptyList()
+                val sanitized = rawList.map { StoragePathUtils.sanitizeAndNormalizePath(it) }.filter { it.isNotBlank() }.distinct()
+                if (sanitized != rawList) {
+                    prefs.edit { putString(KEY_BLACKLISTED_FOLDERS, Gson().toJson(sanitized)) }
+                }
+                sanitized
             } else {
                 emptyList()
             }
@@ -2171,7 +2177,12 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
             val json = prefs.getString(KEY_WHITELISTED_FOLDERS, null)
             if (json != null) {
                 val type = object : com.google.gson.reflect.TypeToken<List<String>>() {}.type
-                Gson().fromJson(json, type) ?: emptyList()
+                val rawList: List<String> = Gson().fromJson(json, type) ?: emptyList()
+                val sanitized = rawList.map { StoragePathUtils.sanitizeAndNormalizePath(it) }.filter { it.isNotBlank() }.distinct()
+                if (sanitized != rawList) {
+                    prefs.edit { putString(KEY_WHITELISTED_FOLDERS, Gson().toJson(sanitized)) }
+                }
+                sanitized
             } else {
                 emptyList()
             }
@@ -4285,9 +4296,11 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
     
     // Blacklisted Folders Methods
     fun addFolderToBlacklist(folderPath: String) {
+        val normalized = StoragePathUtils.sanitizeAndNormalizePath(folderPath)
+        if (normalized.isBlank()) return
         val currentList = _blacklistedFolders.value.toMutableList()
-        if (!currentList.contains(folderPath)) {
-            currentList.add(folderPath)
+        if (!currentList.contains(normalized)) {
+            currentList.add(normalized)
             val json = Gson().toJson(currentList)
             prefs.edit { putString(KEY_BLACKLISTED_FOLDERS, json) }
             _blacklistedFolders.value = currentList
@@ -4295,8 +4308,9 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
     }
     
     fun removeFolderFromBlacklist(folderPath: String) {
+        val normalized = StoragePathUtils.sanitizeAndNormalizePath(folderPath)
         val currentList = _blacklistedFolders.value.toMutableList()
-        if (currentList.remove(folderPath)) {
+        if (currentList.remove(normalized) || currentList.remove(folderPath)) {
             val json = Gson().toJson(currentList)
             prefs.edit { putString(KEY_BLACKLISTED_FOLDERS, json) }
             _blacklistedFolders.value = currentList
@@ -4304,38 +4318,15 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
     }
     
     fun normalizeStoragePath(path: String): String {
-        var normalized = path.trim().replace('\\', '/')
-        while (normalized.contains("//")) {
-            normalized = normalized.replace("//", "/")
-        }
-        if (normalized.length > 1 && normalized.endsWith('/')) {
-            normalized = normalized.substring(0, normalized.length - 1)
-        }
-        // Resolve legacy symlink aliases (e.g. /sdcard, /storage/self/primary) to the
-        // canonical external storage path using OS-level symlink resolution
-        val externalStorage = android.os.Environment.getExternalStorageDirectory().absolutePath
-        if (normalized.startsWith("/") && !normalized.startsWith(externalStorage)) {
-            normalized = try {
-                val candidate = File(normalized).canonicalPath
-                if (candidate.startsWith(externalStorage)) candidate else normalized
-            } catch (_: java.io.IOException) {
-                normalized
-            }
-        }
-        return normalized
+        return StoragePathUtils.sanitizeAndNormalizePath(path)
     }
 
     private fun isFolderSubdirectoryOrEqual(parent: String, child: String): Boolean {
-        val normParent = normalizeStoragePath(parent)
-        val normChild = normalizeStoragePath(child)
-        return normParent.equals(normChild, ignoreCase = true) ||
-            normChild.startsWith(if (normParent.endsWith('/')) normParent else "$normParent/", ignoreCase = true)
+        return StoragePathUtils.isFolderSubdirectoryOrEqual(parent, child)
     }
 
     fun isFolderBlacklisted(folderPath: String): Boolean {
-        return _blacklistedFolders.value.any { blacklistedPath ->
-            isFolderSubdirectoryOrEqual(blacklistedPath, folderPath)
-        }
+        return StoragePathUtils.isPathInFolders(folderPath, _blacklistedFolders.value)
     }
     
     fun clearFolderBlacklist() {
@@ -4438,9 +4429,11 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
     // Song Rating Methods
     // Whitelisted Folders Methods
     fun addFolderToWhitelist(folderPath: String) {
+        val normalized = StoragePathUtils.sanitizeAndNormalizePath(folderPath)
+        if (normalized.isBlank()) return
         val currentList = _whitelistedFolders.value.toMutableList()
-        if (!currentList.contains(folderPath)) {
-            currentList.add(folderPath)
+        if (!currentList.contains(normalized)) {
+            currentList.add(normalized)
             val json = Gson().toJson(currentList)
             prefs.edit { putString(KEY_WHITELISTED_FOLDERS, json) }
             _whitelistedFolders.value = currentList
@@ -4449,8 +4442,9 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
     }
     
     fun removeFolderFromWhitelist(folderPath: String) {
+        val normalized = StoragePathUtils.sanitizeAndNormalizePath(folderPath)
         val currentList = _whitelistedFolders.value.toMutableList()
-        if (currentList.remove(folderPath)) {
+        if (currentList.remove(normalized) || currentList.remove(folderPath)) {
             val json = Gson().toJson(currentList)
             prefs.edit { putString(KEY_WHITELISTED_FOLDERS, json) }
             _whitelistedFolders.value = currentList
@@ -4459,9 +4453,7 @@ private val _autoCheckForUpdates = MutableStateFlow(prefs.getBoolean(KEY_AUTO_CH
     }
     
     fun isFolderWhitelisted(folderPath: String): Boolean {
-        return _whitelistedFolders.value.any { whitelistedPath ->
-            isFolderSubdirectoryOrEqual(whitelistedPath, folderPath)
-        }
+        return StoragePathUtils.isPathInFolders(folderPath, _whitelistedFolders.value)
     }
     
     fun clearFolderWhitelist() {

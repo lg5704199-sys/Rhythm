@@ -743,6 +743,24 @@ class MusicRepository(context: Context) {
         private const val YTMUSIC_MIN_DELAY = 300L
         private const val LRCLIB_MIN_DELAY = 100L
         private const val MAX_CALLS_PER_MINUTE = 30
+
+        fun getArtistImageFileName(artistName: String): String {
+            val cleanName = artistName.trim()
+            val hash = MessageDigest.getInstance("SHA-256")
+                .digest(cleanName.lowercase(Locale.ROOT).toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+                .take(16)
+            val safeSlug = cleanName
+                .replace(Regex("""[\\/:*?"<>|\r\n\t\x00]"""), "_")
+                .take(40)
+                .trimEnd('.', ' ')
+                .ifBlank { "artist" }
+            return "${safeSlug}_${hash}.jpg"
+        }
+
+        fun getLegacyArtistImageFileName(artistName: String): String {
+            return "${artistName}.jpg".replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        }
     }
     
     private fun calculateApiDelay(apiName: String, currentTime: Long): Long {
@@ -5776,18 +5794,35 @@ class MusicRepository(context: Context) {
      * Finds locally stored artist image
      */
     private fun findLocalArtistImage(artistName: String): Uri? {
-        val fileName = "${artistName}.jpg".replace(Regex("[^a-zA-Z0-9._-]"), "_")
-        val file = File(context.filesDir, "artist_images/$fileName")
-        return if (file.exists()) {
-            Uri.fromFile(file).buildUpon().appendQueryParameter("t", file.lastModified().toString()).build()
-        } else {
-            null
+        if (artistName.isBlank()) return null
+        val imageDir = File(context.filesDir, "artist_images")
+        val fileName = getArtistImageFileName(artistName)
+        val file = File(imageDir, fileName)
+        if (file.exists()) {
+            return Uri.fromFile(file).buildUpon().appendQueryParameter("t", file.lastModified().toString()).build()
         }
+
+        val legacyFileName = getLegacyArtistImageFileName(artistName)
+        val legacyBaseName = legacyFileName.removeSuffix(".jpg")
+        if (!legacyBaseName.all { it == '_' }) {
+            val legacyFile = File(imageDir, legacyFileName)
+            if (legacyFile.exists()) {
+                try {
+                    if (!imageDir.exists()) imageDir.mkdirs()
+                    legacyFile.copyTo(file, overwrite = true)
+                    return Uri.fromFile(file).buildUpon().appendQueryParameter("t", file.lastModified().toString()).build()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to migrate legacy artist image for $artistName", e)
+                    return Uri.fromFile(legacyFile).buildUpon().appendQueryParameter("t", legacyFile.lastModified().toString()).build()
+                }
+            }
+        }
+
+        return null
     }
 
     /**
      * Finds artist image from song-adjacent folders.
-     * Checks common names like artist.jpg or band.jpg in album/artist parent folders.
      */
     private fun findArtistImageInLibraryFolders(
         artistName: String,
@@ -5828,7 +5863,24 @@ class MusicRepository(context: Context) {
 
         if (candidateDirs.isEmpty()) return null
 
-        val preferredNames = listOf(
+        val imageExtensions = listOf(".jpg", ".jpeg", ".png", ".webp")
+        val artistSpecificNames = imageExtensions.map { ext -> "${normalizedArtistName.lowercase(Locale.ROOT)}$ext" }
+
+        for (dir in candidateDirs) {
+            val files = dir.listFiles() ?: continue
+            if (files.isEmpty()) continue
+
+            val byLowerName = files
+                .filter { it.isFile }
+                .associateBy { it.name.lowercase(Locale.ROOT) }
+
+            for (specificName in artistSpecificNames) {
+                val match = byLowerName[specificName] ?: continue
+                return Uri.fromFile(match)
+            }
+        }
+
+        val preferredGenericNames = listOf(
             "artist.jpg",
             "artist.jpeg",
             "artist.png",
@@ -5840,14 +5892,34 @@ class MusicRepository(context: Context) {
         )
 
         for (dir in candidateDirs) {
+            val isHostArtistForDir = dir.name.equals(normalizedArtistName, ignoreCase = true) || candidateSongs.any { song ->
+                val songPath = getFilePathFromUri(song.uri) ?: return@any false
+                val songFile = File(songPath)
+                val albumDir = songFile.parentFile
+                val isUnderDir = albumDir == dir || albumDir?.parentFile == dir || albumDir?.parentFile?.parentFile == dir
+                if (!isUnderDir) return@any false
+
+                val explicitAlbumArtist = song.albumArtist?.trim().orEmpty()
+                val primaryArtist = if (explicitAlbumArtist.isNotBlank() && !explicitAlbumArtist.equals("<unknown>", ignoreCase = true)) {
+                    explicitAlbumArtist
+                } else {
+                    song.artist
+                }
+                val firstSplitArtist = splitArtistNames(primaryArtist, preloadedCharDelimiters).firstOrNull()?.trim()
+                primaryArtist.equals(normalizedArtistName, ignoreCase = true) ||
+                    firstSplitArtist.equals(normalizedArtistName, ignoreCase = true)
+            }
+
+            if (!isHostArtistForDir) continue
+
             val files = dir.listFiles() ?: continue
             if (files.isEmpty()) continue
 
             val byLowerName = files
                 .filter { it.isFile }
-                .associateBy { it.name.lowercase() }
+                .associateBy { it.name.lowercase(Locale.ROOT) }
 
-            for (preferred in preferredNames) {
+            for (preferred in preferredGenericNames) {
                 val match = byLowerName[preferred] ?: continue
                 return Uri.fromFile(match)
             }
@@ -5861,7 +5933,7 @@ class MusicRepository(context: Context) {
      */
     private fun saveLocalArtistImage(artistName: String, imageUrl: String) {
         try {
-            val fileName = "${artistName}.jpg".replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val fileName = getArtistImageFileName(artistName)
             val imageDir = File(context.filesDir, "artist_images")
             imageDir.mkdirs()
 
@@ -5883,7 +5955,7 @@ class MusicRepository(context: Context) {
      */
     suspend fun saveArtistArtwork(artistName: String, artworkUri: Uri?): Uri? = withContext(Dispatchers.IO) {
         try {
-            val fileName = "${artistName}.jpg".replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val fileName = getArtistImageFileName(artistName)
             val imageDir = File(context.filesDir, "artist_images")
             if (!imageDir.exists()) {
                 imageDir.mkdirs()
@@ -5893,6 +5965,14 @@ class MusicRepository(context: Context) {
             if (artworkUri == null) {
                 if (file.exists()) {
                     file.delete()
+                }
+                val legacyFileName = getLegacyArtistImageFileName(artistName)
+                val legacyBaseName = legacyFileName.removeSuffix(".jpg")
+                if (!legacyBaseName.all { it == '_' }) {
+                    val legacyFile = File(imageDir, legacyFileName)
+                    if (legacyFile.exists()) {
+                        legacyFile.delete()
+                    }
                 }
                 artistImageCache.remove(artistName)
                 roomDb.artistDao().updateArtworkForArtist(artistName, null)

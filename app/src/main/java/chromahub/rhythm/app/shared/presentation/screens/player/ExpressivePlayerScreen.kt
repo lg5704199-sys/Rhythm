@@ -9,6 +9,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.IntentSenderRequest
+import androidx.media3.common.Player
 import androidx.core.view.WindowCompat
 import androidx.core.graphics.get
 import androidx.compose.animation.core.Spring
@@ -1779,8 +1780,8 @@ fun ExpressivePlayerScreen(
                                             }
                                             "REPEAT" -> {
                                                 val repeatIcon = when (repeatMode) {
-                                                    2 -> RhythmIcons.Player.RepeatOne
-                                                    1 -> RhythmIcons.Player.Repeat
+                                                    Player.REPEAT_MODE_ONE -> RhythmIcons.Player.RepeatOne
+                                                    Player.REPEAT_MODE_ALL -> RhythmIcons.Player.Repeat
                                                     else -> RhythmIcons.Player.Repeat
                                                 }
                                                 RhythmDetailActionButton(
@@ -2066,8 +2067,8 @@ fun ExpressivePlayerScreen(
                                             }
                                             "REPEAT" -> {
                                                 val repeatIcon = when (repeatMode) {
-                                                    2 -> RhythmIcons.Player.RepeatOne
-                                                    1 -> RhythmIcons.Player.Repeat
+                                                    Player.REPEAT_MODE_ONE -> RhythmIcons.Player.RepeatOne
+                                                    Player.REPEAT_MODE_ALL -> RhythmIcons.Player.Repeat
                                                     else -> RhythmIcons.Player.Repeat
                                                 }
                                                 RhythmDetailActionButton(

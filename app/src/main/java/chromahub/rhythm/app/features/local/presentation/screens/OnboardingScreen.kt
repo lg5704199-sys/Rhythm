@@ -141,6 +141,8 @@ import android.content.ActivityNotFoundException
 import android.widget.Toast
 import android.provider.DocumentsContract
 import android.util.Log
+import java.io.File
+import chromahub.rhythm.app.util.StoragePathUtils
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import chromahub.rhythm.app.R
@@ -5879,33 +5881,45 @@ fun EnhancedMediaScanContent(
         if (result.resultCode == Activity.RESULT_OK) {
             result.data?.data?.let { uri ->
                 try {
-                    val docId = DocumentsContract.getTreeDocumentId(uri)
-                    val split = docId.split(":")
+                    val takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    context.contentResolver.takePersistableUriPermission(uri, takeFlags)
+                } catch (e: Exception) {
+                    Log.w("OnboardingMediaScan", "Failed to take persistable URI permission", e)
+                }
 
-                    if (split.size >= 2) {
-                        val storageType = split[0]
-                        val relativePath = split[1]
-
-                        val fullPath = when (storageType) {
-                            "primary" -> "/storage/emulated/0/$relativePath"
-                            "home" -> "/storage/emulated/0/$relativePath"
-                            else -> {
-                                if (storageType.contains("-")) {
-                                    "/storage/$storageType/$relativePath"
-                                } else {
-                                    "/storage/emulated/0/$relativePath"
-                                }
-                            }
-                        }
-
+                try {
+                    val fullPath = StoragePathUtils.getPathFromTreeUri(context, uri)
+                    if (!fullPath.isNullOrBlank()) {
+                        val folderName = File(fullPath).name.ifEmpty { fullPath }
                         if (isBlacklistMode) {
                             appSettings.addFolderToBlacklist(fullPath)
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.folder_blocked_success, folderName),
+                                Toast.LENGTH_SHORT
+                            ).show()
                         } else {
                             appSettings.addFolderToWhitelist(fullPath)
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.folder_whitelisted_success, folderName),
+                                Toast.LENGTH_SHORT
+                            ).show()
                         }
+                    } else {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.error_folder_add_failed),
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                 } catch (e: Exception) {
                     Log.e("OnboardingMediaScan", "Error parsing folder path", e)
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.error_folder_add_failed),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
         }

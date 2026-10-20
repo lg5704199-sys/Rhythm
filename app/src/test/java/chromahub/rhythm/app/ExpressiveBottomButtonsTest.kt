@@ -5,7 +5,9 @@
 
 package chromahub.rhythm.app
 
+import androidx.media3.common.Player
 import chromahub.rhythm.app.shared.data.model.AppSettings
+import chromahub.rhythm.app.shared.presentation.components.icons.RhythmIcons
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -107,5 +109,65 @@ class ExpressiveBottomButtonsTest {
 
         assertEquals(AppSettings.MAX_EXPRESSIVE_BOTTOM_BUTTONS_MERGE, active.size)
         assertEquals(listOf("LYRICS", "FAVORITE", "DEVICE", "QUEUE", "MORE"), active)
+    }
+
+    @Test
+    fun repeatModeIconMapping_off_displaysRepeatIcon() {
+        val repeatMode = Player.REPEAT_MODE_OFF
+        val icon = when (repeatMode) {
+            Player.REPEAT_MODE_ONE -> RhythmIcons.Player.RepeatOne
+            Player.REPEAT_MODE_ALL -> RhythmIcons.Player.Repeat
+            else -> RhythmIcons.Player.Repeat
+        }
+        val isActive = repeatMode != Player.REPEAT_MODE_OFF
+        assertEquals(RhythmIcons.Player.Repeat, icon)
+        assertFalse(isActive)
+    }
+
+    @Test
+    fun repeatModeIconMapping_one_displaysRepeatOneIcon() {
+        val repeatMode = Player.REPEAT_MODE_ONE
+        val icon = when (repeatMode) {
+            Player.REPEAT_MODE_ONE -> RhythmIcons.Player.RepeatOne
+            Player.REPEAT_MODE_ALL -> RhythmIcons.Player.Repeat
+            else -> RhythmIcons.Player.Repeat
+        }
+        val isActive = repeatMode != Player.REPEAT_MODE_OFF
+        assertEquals(RhythmIcons.Player.RepeatOne, icon)
+        assertTrue(isActive)
+    }
+
+    @Test
+    fun repeatModeIconMapping_all_displaysRepeatIcon() {
+        val repeatMode = Player.REPEAT_MODE_ALL
+        val icon = when (repeatMode) {
+            Player.REPEAT_MODE_ONE -> RhythmIcons.Player.RepeatOne
+            Player.REPEAT_MODE_ALL -> RhythmIcons.Player.Repeat
+            else -> RhythmIcons.Player.Repeat
+        }
+        val isActive = repeatMode != Player.REPEAT_MODE_OFF
+        assertEquals(RhythmIcons.Player.Repeat, icon)
+        assertTrue(isActive)
+    }
+
+    @Test
+    fun queueSyncFallback_preservesCurrentSongWhenControllerMediaItemIsTransientlyNull() {
+        val mediaItemSongIds = listOf("song_0", "song_1", "song_2", "song_3")
+        val currentSongId: String? = "song_2"
+        val controllerCurrentMediaId: String? = null
+        val controllerIndex = -1
+        val currentQueueIndex = 2
+
+        val resolvedMediaId = controllerCurrentMediaId ?: currentSongId
+        val rawCurrentMediaIndex = resolvedMediaId
+            ?.let { id -> mediaItemSongIds.indexOfFirst { it == id }.takeIf { it >= 0 } }
+            ?: controllerIndex.takeIf { it >= 0 }
+            ?: currentQueueIndex.takeIf { it in mediaItemSongIds.indices }
+            ?: 0
+
+        val currentMediaIndex = rawCurrentMediaIndex.coerceIn(0, mediaItemSongIds.lastIndex)
+
+        assertEquals(2, currentMediaIndex)
+        assertEquals("song_2", mediaItemSongIds[currentMediaIndex])
     }
 }

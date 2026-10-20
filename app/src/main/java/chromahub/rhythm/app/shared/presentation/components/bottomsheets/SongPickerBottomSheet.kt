@@ -255,7 +255,7 @@ fun SongPickerBottomSheet(
                             EmptySongsState(hasSearch = searchQuery.isNotEmpty(), modifier = Modifier.padding(vertical = 48.dp))
                         }
                     } else {
-                        itemsIndexed(items = filteredSongs, key = { index, song -> "addsong_${song.id}_$index" }) { index, song ->
+                        itemsIndexed(items = filteredSongs, key = { _, song -> "addsong_${song.id}" }) { index, song ->
                             SongSelectionItem(
                                 song = song,
                                 isSelectionMode = isSelectionMode,
@@ -307,7 +307,6 @@ private fun SongSelectionItem(
     )
 
     Surface(
-        onClick = onSongClick,
         modifier = modifier
             .fillMaxWidth()
             .graphicsLayer { scaleX = scale; scaleY = scale }

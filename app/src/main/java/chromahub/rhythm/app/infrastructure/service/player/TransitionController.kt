@@ -428,10 +428,6 @@ class TransitionController(
 
             Log.d(TAG, "Scheduled crossfade at ${transitionPoint}ms (trackDur: $duration, leadTime: ${leadTimeMs}ms). Fade: ${effectiveDuration}ms")
 
-            // Prevent ExoPlayer's auto-advance; we control the transition manually
-            engine.setPauseAtEndOfMediaItems(true)
-            Log.d(TAG, "Enabled pauseAtEndOfMediaItems to prevent auto-skip.")
-
             // Handle case where we're already past the transition point
             if (transitionPoint <= player.currentPosition) {
                 val remaining = duration - player.currentPosition
@@ -439,6 +435,7 @@ class TransitionController(
                 if (remaining > guardWindow + minFade / 2) {
                     if (isLatestSchedule(generation, expectedMediaId, player)) {
                         Log.w(TAG, "Already past transition point! Triggering immediately.")
+                        engine.setPauseAtEndOfMediaItems(true)
                         engine.performTransition(settings.copy(durationMs = adjustedDuration.toInt()))
                     } else {
                         Log.d(TAG, "Skipping immediate trigger for stale schedule.")
@@ -457,6 +454,9 @@ class TransitionController(
                     return@launch
                 }
                 val remaining = transitionPoint - player.currentPosition
+                if (remaining <= 2000L) {
+                    engine.setPauseAtEndOfMediaItems(true)
+                }
                 val sleep = when {
                     remaining > 5000 -> 1000L
                     remaining > 2000 -> 250L
@@ -469,6 +469,7 @@ class TransitionController(
             if (isActive && isLatestSchedule(generation, expectedMediaId, player)) {
                 setState(TransitionState.TRANSITIONING)
                 Log.d(TAG, "FIRING TRANSITION NOW!")
+                engine.setPauseAtEndOfMediaItems(true)
                 engine.performTransition(settings.copy(durationMs = effectiveDuration.toInt()))
                 watchForTransitionCompletion(generation)
             } else {
