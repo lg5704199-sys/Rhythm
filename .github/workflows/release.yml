@@ -1,8 +1,9 @@
 name: Build Release APK
 
 on:
+  workflow_dispatch:
   push:
-    tags: [ 'v*' ]
+    tags: [ 'v*' ] 
 
 permissions:
   contents: write
