@@ -112,7 +112,7 @@ class RhythmPlayerEngine(
     private lateinit var playerA: ExoPlayer
     private lateinit var playerB: ExoPlayer
 
-    // Processadores específicos por player
+    // Processadores de áudio específicos por player
     private var playerABassBoost: RhythmBassBoostProcessor? = null
     private var playerBBassBoost: RhythmBassBoostProcessor? = null
     private var playerASpatialization: RhythmSpatializationProcessor? = null
@@ -246,10 +246,10 @@ class RhythmPlayerEngine(
                 val mime = format.sampleMimeType.orEmpty()
                 val isDolby = mime.contains("eac3") || mime.contains("ac4")
                 if (isDolby) {
-                    // Arquivos Dolby respondem nativamente a -18 LKFS; desliga ReplayGain para não interferir
+                    // Faixas Dolby Atmos respondem nativamente a -18 LKFS; ignora ReplayGain
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
                 } else {
-                    // Arquivos FLAC, WAV, ALAC etc. continuam a depender do ReplayGain
+                    // Ficheiros FLAC, WAV, ALAC etc. continuam a usar o ReplayGain
                     val info = ReplayGainUtil.parse(format)
                     masterPlayer.currentMediaItem?.mediaId?.let { id ->
                         ReplayGainCache.put(id, info)
@@ -432,7 +432,6 @@ class RhythmPlayerEngine(
         monoProcessor: RhythmMonoAudioProcessor? = null,
         replayGainProcessor: ReplayGainAudioProcessor? = null
     ): ExoPlayer {
-        // Buffer seguro para Direct HAL
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 30_000,
@@ -459,7 +458,6 @@ class RhythmPlayerEngine(
             HiFiCapabilityChecker.isSupported() &&
             !hasActiveProcessors
 
-        // 1. MediaCodecSelector: Bloqueia AC3 e prioriza codecs oficiais Dolby (Samsung C2)
         val mediaCodecSelector = MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
             if (mimeType == MimeTypes.AUDIO_AC3) {
                 return@MediaCodecSelector emptyList()
@@ -500,7 +498,6 @@ class RhythmPlayerEngine(
             }
         }
 
-        // 2. RenderersFactory: Prioridade ao MediaCodec com injeção de parâmetros Dolby e bloqueio de FFmpeg para Atmos
         val renderersFactory = object : DefaultRenderersFactory(context) {
             override fun buildAudioRenderers(
                 context: Context,
@@ -607,10 +604,8 @@ class RhythmPlayerEngine(
                             val mime = audioSinkConfig.format.sampleMimeType.orEmpty()
                             val isDolby = mime.contains("eac3") || mime.contains("ac4")
                             if (isDolby) {
-                                // Ignora ReplayGain em faixas Dolby (elas usam -18 LKFS do descodificador)
                                 replayGainProcessor.setMode(ReplayGainUtil.Mode.None, false)
                             } else {
-                                // Aplica ReplayGain normalmente para FLAC, WAV, ALAC etc.
                                 val appSettings = AppSettings.getInstance(context)
                                 applyReplayGainSettingsOnProcessor(replayGainProcessor, appSettings.replayGain.value)
                             }
@@ -756,8 +751,6 @@ class RhythmPlayerEngine(
         shuffleIndices: IntArray? = null,
         startPositionMs: Long = 0L
     ) {
-        // Bloqueia a inicialização paralela pesada do playerB se estiver a reproduzir E-AC-3 ou AC-4,
-        // eliminando a contenção de memória/DSP e prevenindo underruns antes do término da faixa.
         val currentMime = (playerA as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty()
         if (currentMime.contains("eac3") || currentMime.contains("ac4")) {
             Log.d(TAG, "prepareNext ignorado: preservando fluxo contínuo em formato Dolby Atmos")
@@ -1230,27 +1223,6 @@ private class DolbyMediaCodecAudioRenderer(
     eventListener,
     audioSink
 ) {
-    override fun canKeepCodec(
-        codecInfo: androidx.media3.exoplayer.mediacodec.MediaCodecInfo,
-        oldFormat: androidx.media3.common.Format,
-        newFormat: androidx.media3.common.Format
-    ): DecoderReuseEvaluation {
-        // Se a faixa seguinte for do mesmo formato Dolby (E-AC-3 -> E-AC-3 ou AC-4 -> AC-4),
-        // reaproveita a mesma instância sem recriar o descodificador no hardware.
-        if (oldFormat.sampleMimeType == newFormat.sampleMimeType &&
-            (oldFormat.sampleMimeType?.contains("eac3") == true || oldFormat.sampleMimeType?.contains("ac4") == true)
-        ) {
-            return DecoderReuseEvaluation(
-                codecInfo.name,
-                oldFormat,
-                newFormat,
-                DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION,
-                0
-            )
-        }
-        return super.canKeepCodec(codecInfo, oldFormat, newFormat)
-    }
-
     override fun getMediaFormat(
         format: androidx.media3.common.Format,
         codecMimeType: String,
@@ -1271,7 +1243,7 @@ private class DolbyMediaCodecAudioRenderer(
                 // 3. Normalização estrita da Dolby a -18 LKFS / LUFS (padrão de estúdio)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
 
-                // 4. Desativa o compressor dinâmico interno da Dolby que causa o efeito de bombeamento
+                // 4. Desativa o compressor dinâmico interno da Dolby que causava o bombeamento de volume
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
 
