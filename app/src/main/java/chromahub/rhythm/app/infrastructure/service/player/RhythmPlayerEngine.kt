@@ -681,7 +681,7 @@ class RhythmPlayerEngine(
             }
         )
 
-        // Força o salto e cálculo de tempo em qualquer formato sem índice ou avulso
+        // Força a aceitação de seek e estimativa de bitrate contínua
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -706,7 +706,7 @@ class RhythmPlayerEngine(
                 setHandleAudioBecomingNoisy(true)
                 setWakeMode(C.WAKE_MODE_LOCAL)
                 setSkipSilenceEnabled(appSettings.skipSilenceEnabled.value)
-                // CLOSEST_SYNC: Pula direto para o quadro sincronizado sem quebrar timestamps no decodificador C2 da Dolby
+                // CLOSEST_SYNC: Salto instantâneo para o quadro mais próximo sem quebrar os metadados JOC do decodificador C2
                 setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 playWhenReady = false
                 preferredAudioDevice?.let { dev ->
@@ -748,7 +748,8 @@ class RhythmPlayerEngine(
         shuffleIndices: IntArray? = null,
         startPositionMs: Long = 0L
     ) {
-        // Pré-carregamento do Player B restaurado para todos os formatos: essencial para o funcionamento do Gapless
+        // Pré-carregamento do Player B ativo para todos os arquivos (incluindo Dolby Atmos).
+        // Isso permite ao app criar o buffer da próxima música antes da atual terminar e colar o áudio perfeitamente.
         try {
             Log.d(TAG, "prepareNext called for ${mediaItem.mediaId} (targetIndex=$targetIndex, queueSize=${fullQueue?.size ?: 1})")
             ReplayGainCache.get(mediaItem.mediaId)?.let { cachedInfo ->
@@ -1239,6 +1240,7 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 /**
  * Renderizador MediaCodec que força o decodificador nativo da Dolby (c2.dolby.eac3.decoder)
  * a executar o downmix binaural por objetos para auscultadores (2 canais estéreo) a -18 LKFS.
+ * Desativa o Bass Enhancer e qualquer equalização interna da Dolby para manter o som 100% FLAT (idêntico ao AC-4).
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1269,15 +1271,34 @@ private class DolbyMediaCodecAudioRenderer(
         if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
+                // 1. Limita a saída a 2 canais para acionar a binauralização interna no chip da Dolby
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
+
+                // 2. Parâmetros proprietários da Dolby (2 = Auscultadores, 1 = DAX Ativo)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
+
+                // 3. Normalização estrita da Dolby a -18 LKFS / LUFS (padrão de estúdio)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
+
+                // 4. Desativa o compressor dinâmico interno da Dolby (evita bombeamento)
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
 
-                Log.d(DOLBY_TAG, "Dolby vendor params set: mime=$codecMimeType activeDevice=$DOLBY_ACTIVE_DEVICE dax=$DOLBY_DAX_STATE outputLevel=-18 maxChannels=2")
+                // 5. DESATIVA O REFORÇO DE GRAVES (Bass Enhancer / Natural Bass) para o som ficar FLAT como o AC-4
+                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
+
+                // 6. Desativa qualquer equalizador interno e realçador de vozes (preserva a mixagem original)
+                mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.geon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
+
+                Log.d(DOLBY_TAG, "Dolby vendor params set FLAT: mime=$codecMimeType outputLevel=-18 bassEnhancer=0 eq=0")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
