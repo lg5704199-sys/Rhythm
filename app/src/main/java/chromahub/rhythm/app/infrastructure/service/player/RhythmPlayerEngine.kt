@@ -231,11 +231,6 @@ class RhythmPlayerEngine(
                 if (transitionRunning && ::playerB.isInitialized) {
                     playerB.playWhenReady = false
                 }
-                // Liberta buffers e fila do Player B imediatamente ao pausar para poupar RAM
-                if (::playerB.isInitialized && !transitionRunning) {
-                    playerB.stop()
-                    playerB.clearMediaItems()
-                }
                 if (!isFocusLossPause) {
                     abandonAudioFocus()
                 }
@@ -254,7 +249,6 @@ class RhythmPlayerEngine(
                 val mime = format.sampleMimeType.orEmpty()
                 val isDolby = mime.contains("eac3") || mime.contains("ac4")
                 
-                // Ativa a atenuação de -4 dB apenas para faixas Dolby Atmos
                 activeDolbyGainProcessor?.isDolbyAtmos = isDolby
 
                 if (isDolby) {
@@ -462,12 +456,13 @@ class RhythmPlayerEngine(
         replayGainProcessor: ReplayGainAudioProcessor? = null,
         dolbyGainProcessor: DolbyGainAudioProcessor? = null
     ): ExoPlayer {
+        // Buffers originais estáveis restaurados para garantir reprodução contínua (Gapless) sem cortes
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 10_000,
-                /* maxBufferMs = */ 20_000,
-                /* bufferForPlaybackMs = */ 500,
-                /* bufferForPlaybackAfterRebufferMs = */ 1_000
+                /* minBufferMs = */ 30_000,
+                /* maxBufferMs = */ 60_000,
+                /* bufferForPlaybackMs = */ 1_000,
+                /* bufferForPlaybackAfterRebufferMs = */ 2_000
             )
             .setBackBuffer(0, false)
             .setPrioritizeTimeOverSizeThresholds(true)
@@ -686,6 +681,7 @@ class RhythmPlayerEngine(
             }
         )
 
+        // Força o salto e cálculo de tempo em qualquer formato sem índice ou avulso
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -710,7 +706,8 @@ class RhythmPlayerEngine(
                 setHandleAudioBecomingNoisy(true)
                 setWakeMode(C.WAKE_MODE_LOCAL)
                 setSkipSilenceEnabled(appSettings.skipSilenceEnabled.value)
-                setSeekParameters(SeekParameters.EXACT)
+                // CLOSEST_SYNC: Pula direto para o quadro sincronizado sem quebrar timestamps no decodificador C2 da Dolby
+                setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 playWhenReady = false
                 preferredAudioDevice?.let { dev ->
                     try { setPreferredAudioDevice(dev) } catch (e: Exception) { Log.w(TAG, "Failed to apply preferred device", e) }
@@ -751,12 +748,7 @@ class RhythmPlayerEngine(
         shuffleIndices: IntArray? = null,
         startPositionMs: Long = 0L
     ) {
-        val currentMime = (playerA as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty()
-        if (currentMime.contains("eac3") || currentMime.contains("ac4")) {
-            Log.d(TAG, "prepareNext ignorado: preservando recursos de hardware e fluidez em Dolby Atmos")
-            return
-        }
-
+        // Pré-carregamento do Player B restaurado para todos os formatos: essencial para o funcionamento do Gapless
         try {
             Log.d(TAG, "prepareNext called for ${mediaItem.mediaId} (targetIndex=$targetIndex, queueSize=${fullQueue?.size ?: 1})")
             ReplayGainCache.get(mediaItem.mediaId)?.let { cachedInfo ->
