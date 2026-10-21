@@ -28,10 +28,10 @@ import kotlinx.coroutines.launch
  * Orchestrates crossfade transitions by monitoring the master player's playback position
  * and firing transitions at the right moment via [RhythmPlayerEngine].
  *
- * Listens for media item transitions, play/pause changes, timeline changes, and repeat mode
- * changes to schedule or cancel transitions dynamically.
- *
- * Uses global crossfade settings from [AppSettings] (no per-playlist rules in Rhythm).
+ * Em faixas Dolby Atmos (E-AC-3 JOC / AC-4) ou quando o crossfade está desativado (0s),
+ * o crossfade dual-player é desativado para permitir gapless nativo no mesmo AudioTrack,
+ * impedindo que duas instâncias do decoder C2 colidam no hardware da Samsung e derrubem
+ * a flag binaural (0x8022 -> 0x22).
  */
 @OptIn(UnstableApi::class)
 class TransitionController(
@@ -77,28 +77,21 @@ class TransitionController(
     private fun setState(newState: TransitionState) {
         Log.d(TAG, "Transition state: $currentState -> $newState")
         currentState = newState
-        
+
         if (newState == TransitionState.IDLE) {
             completionListener?.onTransitionCompleted()
         }
     }
 
-    /**
-     * Check if currently in a destructive state where cancellation would cause issues
-     */
     fun isInDestructiveState(): Boolean {
         return currentState == TransitionState.TRANSITIONING || currentState == TransitionState.CLEANUP
     }
 
-    /**
-     * Update state based on engine status
-     */
     fun updateTransitionState() {
         if (currentState == TransitionState.TRANSITIONING && !engine.isTransitionRunning()) {
             setState(TransitionState.CLEANUP)
-            // Reset to IDLE after a short delay to allow cleanup
             scope.launch {
-                kotlinx.coroutines.delay(100)
+                delay(100)
                 setState(TransitionState.IDLE)
             }
         }
@@ -136,7 +129,6 @@ class TransitionController(
         return generation == scheduleGeneration && player.currentMediaItem?.mediaId == expectedMediaId
     }
 
-    /** Re-attaches the listener when RhythmPlayerEngine swaps players */
     private val swapListener: (Player) -> Unit = { newPlayer ->
         Log.d(TAG, "Controller detected player swap. Moving listener.")
         transitionListener?.let { listener ->
@@ -155,10 +147,6 @@ class TransitionController(
         }
     }
 
-    /**
-     * Attaches the transition listener to the master player.
-     * Should be called once after the engine is initialized.
-     */
     fun initialize() {
         if (transitionListener != null) return
 
@@ -255,17 +243,13 @@ class TransitionController(
         }
     }
 
-    /**
-     * Schedules a crossfade transition for the given [currentMediaItem].
-     *
-     * This method:
-     * 1. Waits for any active transition to finish
-     * 2. Resolves the next track (respecting repeat mode)
-     * 3. Pre-buffers the next track on Player B
-     * 4. Reads crossfade settings from AppSettings
-     * 5. Calculates the transition point
-     * 6. Polls playback position until the transition point, then fires
-     */
+    private fun isCurrentTrackDolby(): Boolean {
+        val format = engine.getCurrentAudioFormat() ?: return false
+        val mime = format.sampleMimeType.orEmpty().lowercase()
+        val codecs = format.codecs.orEmpty().lowercase()
+        return mime.contains("eac3") || mime.contains("ac4") || codecs.contains("joc") || codecs.contains("ec-3")
+    }
+
     private fun scheduleTransitionFor(currentMediaItem: MediaItem) {
         if (currentState == TransitionState.TRANSITIONING) {
             Log.d(TAG, "Cannot schedule immediately while actively transitioning; stashing ${currentMediaItem.mediaId} for post-transition.")
@@ -279,19 +263,32 @@ class TransitionController(
 
         setState(TransitionState.SCHEDULED)
         transitionSchedulerJob = scope.launch {
-            // Wait for any active transition to finish
             while (engine.isTransitionRunning()) {
                 if (!isActive || !isLatestSchedule(generation, expectedMediaId)) {
                     Log.d(TAG, "Aborting stale schedule while waiting for active transition to finish.")
                     return@launch
                 }
-                Log.d(TAG, "Waiting for active transition to finish...")
                 delay(500)
             }
 
             val player = engine.masterPlayer
             if (!isLatestSchedule(generation, expectedMediaId, player)) {
                 Log.d(TAG, "Aborting stale schedule before transition preparation.")
+                return@launch
+            }
+
+            // ISOLAMENTO DOLBY ATMOS & GAPLESS PERFEITO:
+            // O hardware da Samsung não suporta abrir duas instâncias do decoder C2 simultaneamente.
+            // Se a faixa for Dolby Atmos ou o crossfade estiver desativado, o Player B NÃO é preparado.
+            // O player master emenda as faixas no mesmo decoder e AudioTrack com zero silêncio.
+            val isDolby = isCurrentTrackDolby()
+            val isCrossfadeEnabled = appSettings.crossfade.value && (appSettings.crossfadeDuration.value > 0f)
+
+            if (isDolby || !isCrossfadeEnabled) {
+                Log.d(TAG, "Gapless nativo ativo (isDolby=$isDolby, crossfadeEnabled=$isCrossfadeEnabled). Mantendo AudioTrack contínuo.")
+                engine.cancelNext()
+                engine.setPauseAtEndOfMediaItems(false)
+                setState(TransitionState.IDLE)
                 return@launch
             }
 
@@ -306,19 +303,17 @@ class TransitionController(
                 setState(TransitionState.IDLE)
                 return@launch
             }
-            
-            // Use ExoPlayer's timeline to get the next track correctly (respects shuffle mode)
+
             val currentWindowIndex = player.currentMediaItemIndex
             val timeline = player.currentTimeline
             val nextIndex: Int
-            
-            // Get the next window index using ExoPlayer's timeline (shuffle-aware)
+
             if (timeline.isEmpty || currentWindowIndex == C.INDEX_UNSET) {
                 Log.d(TAG, "Timeline is empty or current index is unset. No transition.")
                 engine.cancelNext()
                 return@launch
             }
-            
+
             val window = Timeline.Window()
             timeline.getWindow(currentWindowIndex, window)
             nextIndex = timeline.getNextWindowIndex(
@@ -326,10 +321,7 @@ class TransitionController(
                 repeatMode,
                 player.shuffleModeEnabled
             )
-            
-            Log.d(TAG, "Current index: $currentWindowIndex, Next index (shuffle-aware): $nextIndex, Shuffle enabled: ${player.shuffleModeEnabled}")
 
-            // Resolve the next media item based on repeat mode and timeline
             val nextMediaItem = when {
                 repeatMode == Player.REPEAT_MODE_ONE -> currentMediaItem
                 nextIndex != C.INDEX_UNSET -> player.getMediaItemAt(nextIndex)
@@ -347,14 +339,6 @@ class TransitionController(
 
             if (!isLatestSchedule(generation, expectedMediaId, player)) {
                 Log.d(TAG, "Aborting stale schedule before preparing next track.")
-                return@launch
-            }
-
-            // Check if crossfade is globally enabled
-            val isCrossfadeEnabled = appSettings.crossfade.value
-            if (!isCrossfadeEnabled) {
-                Log.d(TAG, "Crossfade globally disabled. Using default gap.")
-                engine.setPauseAtEndOfMediaItems(false)
                 return@launch
             }
 
@@ -383,20 +367,12 @@ class TransitionController(
                 shuffleIndices = shuffleIndices
             )
 
-            // Build transition settings from global preferences
             val crossfadeDurationMs = (appSettings.crossfadeDuration.value * 1000).toInt()
             val settings = TransitionSettings(
                 mode = TransitionMode.OVERLAP,
                 durationMs = crossfadeDurationMs,
             )
 
-            if (settings.mode == TransitionMode.NONE || settings.durationMs <= 0) {
-                Log.d(TAG, "Transition disabled or zero duration.")
-                engine.setPauseAtEndOfMediaItems(false)
-                return@launch
-            }
-
-            // Wait for track duration to become available
             var duration = player.duration
             while ((duration == C.TIME_UNSET || duration <= 0) && isActive) {
                 if (!isLatestSchedule(generation, expectedMediaId, player)) {
@@ -428,7 +404,6 @@ class TransitionController(
 
             Log.d(TAG, "Scheduled crossfade at ${transitionPoint}ms (trackDur: $duration, leadTime: ${leadTimeMs}ms). Fade: ${effectiveDuration}ms")
 
-            // Handle case where we're already past the transition point
             if (transitionPoint <= player.currentPosition) {
                 val remaining = duration - player.currentPosition
                 val adjustedDuration = (remaining - guardWindow).coerceAtLeast(minFade)
@@ -437,8 +412,6 @@ class TransitionController(
                         Log.w(TAG, "Already past transition point! Triggering immediately.")
                         engine.setPauseAtEndOfMediaItems(true)
                         engine.performTransition(settings.copy(durationMs = adjustedDuration.toInt()))
-                    } else {
-                        Log.d(TAG, "Skipping immediate trigger for stale schedule.")
                     }
                 } else {
                     Log.w(TAG, "Too close to end (${remaining}ms left). Skipping to avoid glitch.")
@@ -447,7 +420,6 @@ class TransitionController(
                 return@launch
             }
 
-            // Adaptive polling — sleep longer when far from transition point
             while (player.currentPosition < transitionPoint && isActive) {
                 if (!isLatestSchedule(generation, expectedMediaId, player)) {
                     Log.d(TAG, "Aborting stale schedule while polling transition point.")
@@ -491,22 +463,21 @@ class TransitionController(
 
         Log.d(TAG, "Handling seek to ${positionMs}ms for ${mediaItem.mediaId}")
 
-        // Cancel any pending transitions
         pendingScheduleMediaItem = null
         invalidateScheduledTransitions()
         transitionSchedulerJob?.cancel()
 
-        // Check if crossfade is globally enabled
-        val isCrossfadeEnabled = appSettings.crossfade.value
-        if (!isCrossfadeEnabled) {
-            Log.d(TAG, "Crossfade globally disabled. Skipping seek transition handling.")
+        val isDolby = isCurrentTrackDolby()
+        val isCrossfadeEnabled = appSettings.crossfade.value && (appSettings.crossfadeDuration.value > 0f)
+
+        if (isDolby || !isCrossfadeEnabled) {
+            Log.d(TAG, "Seek on gapless/Dolby track. Skipping crossfade rescheduling.")
             engine.cancelNext()
             engine.setPauseAtEndOfMediaItems(false)
             setState(TransitionState.IDLE)
             return
         }
 
-        // Calculate the transition point
         val duration = player.duration
         if (duration == C.TIME_UNSET || duration <= 0) {
             Log.d(TAG, "Duration unset. Rescheduling transition normally.")
@@ -552,14 +523,11 @@ class TransitionController(
         Log.d(TAG, "setManualTransitioning requested")
         invalidateScheduledTransitions()
         transitionSchedulerJob?.cancel()
-        
+
         setState(TransitionState.TRANSITIONING)
         watchForTransitionCompletion(scheduleGeneration)
     }
 
-    /**
-     * Releases the controller, removing all listeners and cancelling jobs.
-     */
     fun release() {
         Log.d(TAG, "Releasing controller.")
         invalidateScheduledTransitions()
