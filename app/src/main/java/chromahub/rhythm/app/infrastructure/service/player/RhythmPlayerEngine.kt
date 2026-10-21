@@ -44,9 +44,11 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -70,7 +72,11 @@ import chromahub.rhythm.app.util.calculateVolumeOut
 import chromahub.rhythm.app.util.envelope
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -85,13 +91,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-// Parâmetros proprietários da Dolby no Android C2
-// 2 = Auscultadores (Headphones); 1 = DAX State ativo para renderização binaural
-private const val DOLBY_ACTIVE_DEVICE = 2
-private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
 
-// Ganho de -4 dB (10^(-4/20) ≈ 0.631f) aplicado em PCM para neutralizar os -14 dB forçados pela Samsung
+// Ganho de -4 dB (10^(-4/20) ≈ 0.631f) aplicado em PCM para neutralizar os -14 dB forçados pela Samsung e atingir -18 LKFS reais
 private const val DOLBY_HEADROOM_GAIN = 0.631f
 
 @OptIn(UnstableApi::class)
@@ -223,21 +225,13 @@ class RhythmPlayerEngine(
 
     private fun enforceSamsungSoundAliveProfile() {
         scope.launch {
-            // O SoundAlive tenta forçar o Profile 0 (Auto) cerca de 70ms após o início.
-            // Sobrescrevemos aos 120ms e reafirmamos aos 350ms para garantir o perfil Música (2).
+            // Desativa apenas o volume leveler dinâmico.
+            // Removido o g_effect_dolby_profile=2 para evitar que a Samsung force o modo Música equalizado com realce de voz (deon=1, ded=2).
             delay(120)
             try {
-                audioManager.setParameters("g_effect_dolby_profile=2")
                 audioManager.setParameters("g_effect_dolby_volume_leveler=0")
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to force profile 2 on SoundAlive (pass 1)", e)
-            }
-            delay(230)
-            try {
-                audioManager.setParameters("g_effect_dolby_profile=2")
-                audioManager.setParameters("g_effect_dolby_volume_leveler=0")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to force profile 2 on SoundAlive (pass 2)", e)
+                Log.w(TAG, "Failed to disable SoundAlive volume leveler", e)
             }
         }
     }
@@ -249,7 +243,7 @@ class RhythmPlayerEngine(
                 if (transitionRunning && ::playerB.isInitialized && playerB.playbackState != Player.STATE_ENDED) {
                     playerB.playWhenReady = true
                 }
-                val currentMime = (masterPlayer as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty()
+                val currentMime = (masterPlayer as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty().lowercase()
                 if (currentMime.contains("eac3") || currentMime.contains("ac4")) {
                     enforceSamsungSoundAliveProfile()
                 }
@@ -272,10 +266,14 @@ class RhythmPlayerEngine(
             Log.d(TAG, "Tracks changed")
             val format = tracks.getFirstSelectedTrackFormatByType(C.TRACK_TYPE_AUDIO) ?: (masterPlayer as? ExoPlayer)?.audioFormat
             if (format != null) {
-                val mime = format.sampleMimeType.orEmpty()
-                val isDolby = mime.contains("eac3") || mime.contains("ac4")
-                
+                val mime = format.sampleMimeType.orEmpty().lowercase()
+                val codecs = format.codecs.orEmpty().lowercase()
+                val isEac3 = mime.contains("eac3") || mime.contains("ec-3") || codecs.contains("joc") || codecs.contains("ec-3")
+                val isAc4 = mime.contains("ac4") || mime.contains("ac-4")
+                val isDolby = isEac3 || isAc4
+
                 activeDolbyGainProcessor?.isDolbyAtmos = isDolby
+                activeDolbyGainProcessor?.isEac3Joc = isEac3
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
@@ -483,7 +481,6 @@ class RhythmPlayerEngine(
         replayGainProcessor: ReplayGainAudioProcessor? = null,
         dolbyGainProcessor: DolbyGainAudioProcessor? = null
     ): ExoPlayer {
-        // Buffers estáveis para permitir leitura adiantada e emenda contínua perfeita (Gapless)
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 30_000,
@@ -655,6 +652,14 @@ class RhythmPlayerEngine(
                     .setEnableFloatOutput(floatOutputPref)
                     .setEnableAudioOutputPlaybackParameters(true)
                     .setAudioProcessorChain(processorChain)
+                    // Buffer estendido no AudioTrack para eliminar BUFFER TIMEOUT / underrun que derrubava a flag 0x8022
+                    .setAudioTrackBufferSizeProvider(
+                        DefaultAudioTrackBufferSizeProvider.Builder()
+                            .setMinPcmBufferDurationUs(500_000)
+                            .setMaxPcmBufferDurationUs(1_500_000)
+                            .setPcmBufferMultiplicationFactor(6)
+                            .build()
+                    )
                     .build()
             }
         }.apply {
@@ -667,8 +672,9 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
+        // IGUAL AO APPLE MUSIC: Usar CONTENT_TYPE_UNKNOWN induz o decodificador C2 da Samsung ao Profile 6 neutro (ieon=0, deon=0)
         val audioAttributes = AudioAttributes.Builder()
-            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setContentType(C.AUDIO_CONTENT_TYPE_UNKNOWN)
             .setUsage(C.USAGE_MEDIA)
             .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_AUTO)
             .build()
@@ -933,10 +939,14 @@ class RhythmPlayerEngine(
         val mediaIdToSync = playerA.currentMediaItem?.mediaId ?: incomingMediaId
         val tracks = playerA.currentTracks
         val format = tracks.getFirstSelectedTrackFormatByType(C.TRACK_TYPE_AUDIO) ?: (playerA as? ExoPlayer)?.audioFormat
-        val mime = format?.sampleMimeType.orEmpty()
-        val isDolby = mime.contains("eac3") || mime.contains("ac4")
-        
+        val mime = format?.sampleMimeType.orEmpty().lowercase()
+        val codecs = format?.codecs.orEmpty().lowercase()
+        val isEac3 = mime.contains("eac3") || mime.contains("ec-3") || codecs.contains("joc") || codecs.contains("ec-3")
+        val isAc4 = mime.contains("ac4") || mime.contains("ac-4")
+        val isDolby = isEac3 || isAc4
+
         activeDolbyGainProcessor?.isDolbyAtmos = isDolby
+        activeDolbyGainProcessor?.isEac3Joc = isEac3
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
@@ -1104,7 +1114,7 @@ class RhythmPlayerEngine(
     }
 
     fun applyReplayGainSettings(enabled: Boolean) {
-        val currentMime = (masterPlayer as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty()
+        val currentMime = (masterPlayer as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty().lowercase()
         val isDolby = currentMime.contains("eac3") || currentMime.contains("ac4")
         if (!isDolby) {
             if (::playerAReplayGain.isInitialized) {
@@ -1225,8 +1235,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador de áudio que atenua faixas em Dolby Atmos (E-AC-3 JOC / AC-4) em -4 dB (fator 0.631).
- * Neutraliza os -14 dB forçados pelo SoundAlive da Samsung, garantindo dinâmica real de -18 LKFS.
+ * Processador PCM dedicado para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
+ * 1. Aplica headroom de -4 dB (fator 0.631) para compensar a saída fixa em -14 dB da Samsung e atingir -18 LKFS.
+ * 2. Em faixas E-AC-3 JOC, aplica filtro Biquad Low-Shelf em 95 Hz (-5.0 dB) para neutralizar a soma do canal LFE (.1).
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1234,12 +1245,52 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     @Volatile
     var isDolbyAtmos: Boolean = false
 
+    @Volatile
+    var isEac3Joc: Boolean = false
+
+    private var b0 = 1.0f
+    private var b1 = 0.0f
+    private var b2 = 0.0f
+    private var a1 = 0.0f
+    private var a2 = 0.0f
+
+    private var x1L = 0f; private var x2L = 0f; private var y1L = 0f; private var y2L = 0f
+    private var x1R = 0f; private var x2R = 0f; private var y1R = 0f; private var y2R = 0f
+
+    private fun updateFilterCoefficients(sampleRate: Int) {
+        val gainDb = -5.0f // Atenua 5 dB de subgraves inflados pelo LFE de cinema
+        val fc = 95.0f
+        val a = 10.0.pow(gainDb / 40.0).toFloat()
+        val w0 = (2.0 * Math.PI * fc / sampleRate).toFloat()
+        val cosW0 = cos(w0)
+        val sinW0 = sin(w0)
+        val alpha = sinW0 / (2.0f * 0.70710677f)
+        val twoSqrtAAlpha = 2.0f * sqrt(a) * alpha
+
+        val a0 = (a + 1.0f) + (a - 1.0f) * cosW0 + twoSqrtAAlpha
+        b0 = (a * ((a + 1.0f) - (a - 1.0f) * cosW0 + twoSqrtAAlpha)) / a0
+        b1 = (2.0f * a * ((a - 1.0f) - (a + 1.0f) * cosW0)) / a0
+        b2 = (a * ((a + 1.0f) - (a - 1.0f) * cosW0 - twoSqrtAAlpha)) / a0
+        a1 = (-2.0f * ((a - 1.0f) + (a + 1.0f) * cosW0)) / a0
+        a2 = ((a + 1.0f) - (a - 1.0f) * cosW0 - twoSqrtAAlpha) / a0
+    }
+
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
-            inputAudioFormat
-        } else {
-            AudioProcessor.AudioFormat.NOT_SET
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT || inputAudioFormat.channelCount != 2) {
+            return AudioProcessor.AudioFormat.NOT_SET
         }
+        updateFilterCoefficients(inputAudioFormat.sampleRate)
+        resetFilterState()
+        Log.d(DOLBY_TAG, "DolbyGainAudioProcessor configurado: sr=${inputAudioFormat.sampleRate}Hz gain=-4dB lfeShelf=-5dB@95Hz")
+        return inputAudioFormat
+    }
+
+    override fun onFlush() = resetFilterState()
+    override fun onReset() = resetFilterState()
+
+    private fun resetFilterState() {
+        x1L = 0f; x2L = 0f; y1L = 0f; y2L = 0f
+        x1R = 0f; x2R = 0f; y1R = 0f; y2R = 0f
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -1250,10 +1301,23 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         if (!isDolbyAtmos) {
             out.put(inputBuffer)
         } else {
+            val applyLfeCut = isEac3Joc
             while (inputBuffer.hasRemaining()) {
-                val sample = inputBuffer.short
-                val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
-                out.putShort(scaled)
+                var sampleL = inputBuffer.short.toFloat() * DOLBY_HEADROOM_GAIN
+                var sampleR = inputBuffer.short.toFloat() * DOLBY_HEADROOM_GAIN
+
+                if (applyLfeCut) {
+                    val outL = b0 * sampleL + b1 * x1L + b2 * x2L - a1 * y1L - a2 * y2L
+                    x2L = x1L; x1L = sampleL; y2L = y1L; y1L = outL
+                    sampleL = outL
+
+                    val outR = b0 * sampleR + b1 * x1R + b2 * x2R - a1 * y1R - a2 * y2R
+                    x2R = x1R; x1R = sampleR; y2R = y1R; y2R = outR
+                    sampleR = outR
+                }
+
+                out.putShort(sampleL.roundToInt().coerceIn(-32768, 32767).toShort())
+                out.putShort(sampleR.roundToInt().coerceIn(-32768, 32767).toShort())
             }
         }
         out.flip()
@@ -1290,49 +1354,65 @@ private class DolbyMediaCodecAudioRenderer(
         codecOperatingRate: Float
     ): MediaFormat {
         val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
-        if (codecMimeType.contains("eac3") || codecMimeType.contains("ac4")) {
+        val mime = format.sampleMimeType.orEmpty().lowercase()
+        val codecs = format.codecs.orEmpty().lowercase()
+        val isEac3 = mime.contains("eac3") || mime.contains("ec-3") || codecs.contains("joc") || codecs.contains("ec-3")
+        val isAc4 = mime.contains("ac4") || mime.contains("ac-4")
+        val isDolby = isEac3 || isAc4
+
+        if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
+            dolbyGainProcessor?.isEac3Joc = isEac3
             try {
+                // Força saída binaural em 2 canais (0x8022)
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
-                mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
-                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-                mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
 
-                // Trava o decodificador no Profile 2 (Música)
-                mediaFormat.setInteger("vendor.dolby.profile.value", 2)
-                mediaFormat.setInteger("vendor.dolby.dap.profile.value", 2)
-                mediaFormat.setInteger("vendor.dolby.profile-index.value", 2)
-
-                // Desativa compressores dinâmicos e niveladores
+                // Desativa equalizadores e compressores dinâmicos internos
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
-
-                // Desativa reforço de graves (Bass Enhancer / Natural Bass)
                 mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
-
-                // Desativa Surround Boost e Virtualizer Boost
                 mediaFormat.setInteger("vendor.dolby.dap.surround-boost", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dsb.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.vmb.value", 0)
-
-                // Desativa equalizador gráfico e realçador de vozes
                 mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.geon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
 
-                Log.d(DOLBY_TAG, "Dolby vendor params set FLAT: mime=$codecMimeType outputLevel=-18 bassEnhancer=0 eq=0")
+                Log.d(DOLBY_TAG, "Dolby MediaFormat preparado em modo estéreo binaural limpo.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
         } else {
             dolbyGainProcessor?.isDolbyAtmos = false
+            dolbyGainProcessor?.isEac3Joc = false
         }
         return mediaFormat
+    }
+
+    override fun canKeepCodec(
+        codecInfo: MediaCodecInfo,
+        oldFormat: androidx.media3.common.Format,
+        newFormat: androidx.media3.common.Format
+    ): DecoderReuseEvaluation {
+        val evaluation = super.canKeepCodec(codecInfo, oldFormat, newFormat)
+        // Permite reuso contínuo do mesmo decodificador C2 entre faixas consecutivas (Gapless real sem recriar codec)
+        if (oldFormat.sampleMimeType == newFormat.sampleMimeType &&
+            oldFormat.sampleRate == newFormat.sampleRate
+        ) {
+            return DecoderReuseEvaluation(
+                codecInfo.name,
+                oldFormat,
+                newFormat,
+                DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION,
+                0
+            )
+        }
+        return evaluation
     }
 }
 
