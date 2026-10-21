@@ -1,3 +1,4 @@
+
 /*
  * SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -44,6 +45,7 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
@@ -85,12 +87,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-// Parâmetros proprietários da Dolby no Android C2
 private const val DOLBY_ACTIVE_DEVICE = 2
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
-
-// Ganho de -4 dB (10^(-4/20) ≈ 0.631f) aplicado em PCM para neutralizar os -14 dB forçados pela Samsung e atingir -18 LKFS reais
 private const val DOLBY_HEADROOM_GAIN = 0.631f
 
 @OptIn(UnstableApi::class)
@@ -725,7 +724,8 @@ class RhythmPlayerEngine(
                 setHandleAudioBecomingNoisy(true)
                 setWakeMode(C.WAKE_MODE_LOCAL)
                 setSkipSilenceEnabled(appSettings.skipSilenceEnabled.value)
-                setSeekParameters(SeekParameters.EXACT)
+                // CLOSEST_SYNC permite que ficheiros E-AC-3 JOC a 768 kbps saltem de tempo de imediato
+                setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 playWhenReady = false
                 preferredAudioDevice?.let { dev ->
                     try { setPreferredAudioDevice(dev) } catch (e: Exception) { Log.w(TAG, "Failed to apply preferred device", e) }
@@ -1344,19 +1344,16 @@ private class DolbyMediaCodecAudioRenderer(
             dolbyGainProcessor?.isDolbyAtmos = true
             dolbyGainProcessor?.isEac3Joc = isEac3
             try {
-                // Parâmetros obrigatórios para a inicialização bem-sucedida do c2.dolby.eac3.decoder da Samsung
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
 
-                // Trava perfil básico
                 mediaFormat.setInteger("vendor.dolby.profile.value", 2)
                 mediaFormat.setInteger("vendor.dolby.dap.profile.value", 2)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", 2)
 
-                // Desativa filtros dinâmicos artificiais
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
