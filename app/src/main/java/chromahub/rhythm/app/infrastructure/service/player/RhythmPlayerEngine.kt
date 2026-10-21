@@ -48,7 +48,6 @@ import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
-import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -91,9 +90,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
+// Parâmetros proprietários da Dolby no Android C2
+private const val DOLBY_ACTIVE_DEVICE = 2
+private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
 
-// Ganho de -4 dB (10^(-4/20) ≈ 0.631f) aplicado em PCM para neutralizar os -14 dB forçados pela Samsung e atingir -18 LKFS reais
+// Ganho de -4 dB (10^(-4/20) ≈ 0.631f) aplicado em PCM para neutralizar os -14 dB forçados pela Samsung e atingir -18 LKFS
 private const val DOLBY_HEADROOM_GAIN = 0.631f
 
 @OptIn(UnstableApi::class)
@@ -481,14 +483,15 @@ class RhythmPlayerEngine(
         replayGainProcessor: ReplayGainAudioProcessor? = null,
         dolbyGainProcessor: DolbyGainAudioProcessor? = null
     ): ExoPlayer {
+        // Buffers otimizados: carregamento rápido ao dar seek (elimina o spinner longo)
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                /* minBufferMs = */ 30_000,
-                /* maxBufferMs = */ 60_000,
-                /* bufferForPlaybackMs = */ 1_000,
-                /* bufferForPlaybackAfterRebufferMs = */ 2_000
+                /* minBufferMs = */ 15_000,
+                /* maxBufferMs = */ 30_000,
+                /* bufferForPlaybackMs = */ 250,
+                /* bufferForPlaybackAfterRebufferMs = */ 500
             )
-            .setBackBuffer(0, false)
+            .setBackBuffer(10_000, true)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
@@ -652,7 +655,7 @@ class RhythmPlayerEngine(
                     .setEnableFloatOutput(floatOutputPref)
                     .setEnableAudioOutputPlaybackParameters(true)
                     .setAudioProcessorChain(processorChain)
-                    // Buffer estendido no AudioTrack para eliminar BUFFER TIMEOUT / underrun que derrubava a flag 0x8022
+                    // Buffer estendido no AudioTrack para eliminar BUFFER TIMEOUT / underrun
                     .setAudioTrackBufferSizeProvider(
                         DefaultAudioTrackBufferSizeProvider.Builder()
                             .setMinPcmBufferDurationUs(500_000)
@@ -738,7 +741,7 @@ class RhythmPlayerEngine(
                 setHandleAudioBecomingNoisy(true)
                 setWakeMode(C.WAKE_MODE_LOCAL)
                 setSkipSilenceEnabled(appSettings.skipSilenceEnabled.value)
-                setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                setSeekParameters(SeekParameters.EXACT)
                 playWhenReady = false
                 preferredAudioDevice?.let { dev ->
                     try { setPreferredAudioDevice(dev) } catch (e: Exception) { Log.w(TAG, "Failed to apply preferred device", e) }
@@ -1235,8 +1238,8 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador PCM dedicado para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
- * 1. Aplica headroom de -4 dB (fator 0.631) para compensar a saída fixa em -14 dB da Samsung e atingir -18 LKFS.
+ * Processador de áudio PCM dedicado para faixas em Dolby Atmos (E-AC-3 JOC / AC-4).
+ * 1. Aplica headroom gain de -4 dB (fator 0.631) para compensar a saída fixa em -14 dB da Samsung e cravar -18 LKFS.
  * 2. Em faixas E-AC-3 JOC, aplica filtro Biquad Low-Shelf em 95 Hz (-5.0 dB) para neutralizar a soma do canal LFE (.1).
  */
 @OptIn(UnstableApi::class)
@@ -1392,27 +1395,6 @@ private class DolbyMediaCodecAudioRenderer(
             dolbyGainProcessor?.isEac3Joc = false
         }
         return mediaFormat
-    }
-
-    override fun canKeepCodec(
-        codecInfo: MediaCodecInfo,
-        oldFormat: androidx.media3.common.Format,
-        newFormat: androidx.media3.common.Format
-    ): DecoderReuseEvaluation {
-        val evaluation = super.canKeepCodec(codecInfo, oldFormat, newFormat)
-        // Permite reuso contínuo do mesmo decodificador C2 entre faixas consecutivas (Gapless real sem recriar codec)
-        if (oldFormat.sampleMimeType == newFormat.sampleMimeType &&
-            oldFormat.sampleRate == newFormat.sampleRate
-        ) {
-            return DecoderReuseEvaluation(
-                codecInfo.name,
-                oldFormat,
-                newFormat,
-                DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION,
-                0
-            )
-        }
-        return evaluation
     }
 }
 
