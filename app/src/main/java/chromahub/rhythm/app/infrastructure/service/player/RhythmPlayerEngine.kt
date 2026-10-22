@@ -51,7 +51,6 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.video.VideoRendererEventListener
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.mp3.Mp3Extractor
 import androidx.media3.extractor.mp4.FragmentedMp4Extractor
@@ -74,11 +73,7 @@ import chromahub.rhythm.app.util.calculateVolumeOut
 import chromahub.rhythm.app.util.envelope
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
-import kotlin.math.cos
-import kotlin.math.pow
 import kotlin.math.roundToInt
-import kotlin.math.sin
-import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -263,12 +258,9 @@ class RhythmPlayerEngine(
             if (format != null) {
                 val mime = format.sampleMimeType.orEmpty().lowercase()
                 val codecs = format.codecs.orEmpty().lowercase()
-                val isEac3 = mime.contains("eac3") || mime.contains("ec-3") || codecs.contains("joc") || codecs.contains("ec-3")
-                val isAc4 = mime.contains("ac4") || mime.contains("ac-4")
-                val isDolby = isEac3 || isAc4
+                val isDolby = mime.contains("eac3") || mime.contains("ec-3") || mime.contains("ac4") || codecs.contains("joc")
 
                 activeDolbyGainProcessor?.isDolbyAtmos = isDolby
-                activeDolbyGainProcessor?.isEac3Joc = isEac3
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
@@ -539,20 +531,6 @@ class RhythmPlayerEngine(
         }
 
         val renderersFactory = object : DefaultRenderersFactory(context) {
-            // Assinatura exacta do Media3 com allowedVideoJoiningTimeMs do tipo Long
-            override fun buildVideoRenderers(
-                context: Context,
-                extensionRendererMode: Int,
-                mediaCodecSelector: MediaCodecSelector,
-                enableDecoderFallback: Boolean,
-                eventHandler: Handler,
-                eventListener: VideoRendererEventListener,
-                allowedVideoJoiningTimeMs: Long,
-                out: ArrayList<Renderer>
-            ) {
-                // Deixa a lista vazia propositadamente para desativar qualquer descodificação de vídeo
-            }
-
             override fun buildAudioRenderers(
                 context: Context,
                 extensionRendererMode: Int,
@@ -710,17 +688,11 @@ class RhythmPlayerEngine(
             }
         )
 
+        // Extratores com suporte a tabelas de edição de MP4 sem flags de câmara SEF
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
-            .setMp4ExtractorFlags(
-                Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS or
-                Mp4Extractor.FLAG_READ_SEF_DATA
-            )
-            .setFragmentedMp4ExtractorFlags(
-                FragmentedMp4Extractor.FLAG_WORKAROUND_EVERY_VIDEO_FRAME_IS_SYNC_FRAME or
-                FragmentedMp4Extractor.FLAG_WORKAROUND_IGNORE_TFDT_BOX
-            )
+            .setMp4ExtractorFlags(Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS)
             .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING)
             .setAdtsExtractorFlags(AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING)
 
@@ -728,10 +700,7 @@ class RhythmPlayerEngine(
             .setDataSourceFactory(resolvingDataSourceFactory)
 
         val trackSelectionParameters = buildTrackSelectionParameters(
-            TrackSelectionParameters.DEFAULT.buildUpon()
-                .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
-                .setTrackTypeDisabled(C.TRACK_TYPE_IMAGE, true)
-                .build(),
+            TrackSelectionParameters.DEFAULT,
             appSettings
         )
 
@@ -942,12 +911,9 @@ class RhythmPlayerEngine(
         val format = tracks.getFirstSelectedTrackFormatByType(C.TRACK_TYPE_AUDIO) ?: (playerA as? ExoPlayer)?.audioFormat
         val mime = format?.sampleMimeType.orEmpty().lowercase()
         val codecs = format?.codecs.orEmpty().lowercase()
-        val isEac3 = mime.contains("eac3") || mime.contains("ec-3") || codecs.contains("joc") || codecs.contains("ec-3")
-        val isAc4 = mime.contains("ac4") || mime.contains("ac-4")
-        val isDolby = isEac3 || isAc4
+        val isDolby = mime.contains("eac3") || mime.contains("ec-3") || mime.contains("ac4") || codecs.contains("joc")
 
         activeDolbyGainProcessor?.isDolbyAtmos = isDolby
-        activeDolbyGainProcessor?.isEac3Joc = isEac3
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
@@ -1132,8 +1098,13 @@ class RhythmPlayerEngine(
         baseParameters: TrackSelectionParameters,
         appSettings: AppSettings
     ): TrackSelectionParameters {
+        // Bloqueia faixas de vídeo e imagem para não sequestrarem a timeline do áudio
+        val builder = baseParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+            .setTrackTypeDisabled(C.TRACK_TYPE_IMAGE, true)
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            return baseParameters
+            return builder.build()
         }
 
         val isCrossfadeEnabled = appSettings.crossfade.value
@@ -1165,7 +1136,7 @@ class RhythmPlayerEngine(
             .setIsGaplessSupportRequired(appSettings.gaplessPlayback.value)
             .build()
 
-        return baseParameters.buildUpon()
+        return builder
             .setAudioOffloadPreferences(audioOffloadPreferences)
             .build()
     }
@@ -1230,10 +1201,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador de áudio PCM dedicado para faixas em Dolby Atmos (E-AC-3 JOC / AC-4).
- * 1. Aplica headroom gain linear (-4 dB / 0.631f) para compensar a saída fixa em -14 dB da Samsung.
- * 2. Em faixas E-AC-3 JOC, aplica atenuação suave (-2.5 dB em 75 Hz com Q=0.5)
- *    para conter ressonâncias de subwoofer sem causar cancelamento de fase na batida e nos instrumentos.
+ * Processador de áudio PCM robusto e linear para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
+ * Aplica exclusivamente o headroom gain (-4 dB / 0.631f) para compensar a atenuação de -14 dB da Samsung,
+ * eliminando distorções de saturação sem gerar desvios de fase nem cancelamento acústico nos graves.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1241,54 +1211,12 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     @Volatile
     var isDolbyAtmos: Boolean = false
 
-    @Volatile
-    var isEac3Joc: Boolean = false
-
-    private var b0 = 1.0f
-    private var b1 = 0.0f
-    private var b2 = 0.0f
-    private var a1 = 0.0f
-    private var a2 = 0.0f
-
-    private var x1L = 0f; private var x2L = 0f; private var y1L = 0f; private var y2L = 0f
-    private var x1R = 0f; private var x2R = 0f; private var y1R = 0f; private var y2R = 0f
-
-    private fun updateFilterCoefficients(sampleRate: Int) {
-        val sr = if (sampleRate > 0) sampleRate else 48000
-        val gainDb = -2.5f
-        val fc = 75.0f
-        val q = 0.5f
-
-        val a = 10.0.pow(gainDb / 40.0).toFloat()
-        val w0 = (2.0 * Math.PI * fc / sr).toFloat()
-        val cosW0 = cos(w0)
-        val sinW0 = sin(w0)
-        val alpha = sinW0 / (2.0f * q)
-        val twoSqrtAAlpha = 2.0f * sqrt(a) * alpha
-
-        val a0 = (a + 1.0f) + (a - 1.0f) * cosW0 + twoSqrtAAlpha
-        b0 = (a * ((a + 1.0f) - (a - 1.0f) * cosW0 + twoSqrtAAlpha)) / a0
-        b1 = (2.0f * a * ((a - 1.0f) - (a + 1.0f) * cosW0)) / a0
-        b2 = (a * ((a + 1.0f) - (a - 1.0f) * cosW0 - twoSqrtAAlpha)) / a0
-        a1 = (-2.0f * ((a - 1.0f) + (a + 1.0f) * cosW0)) / a0
-        a2 = ((a + 1.0f) - (a - 1.0f) * cosW0 - twoSqrtAAlpha) / a0
-    }
-
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
-            return AudioProcessor.AudioFormat.NOT_SET
+        return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
+            inputAudioFormat
+        } else {
+            AudioProcessor.AudioFormat.NOT_SET
         }
-        updateFilterCoefficients(inputAudioFormat.sampleRate)
-        resetFilterState()
-        return inputAudioFormat
-    }
-
-    override fun onFlush() = resetFilterState()
-    override fun onReset() = resetFilterState()
-
-    private fun resetFilterState() {
-        x1L = 0f; x2L = 0f; y1L = 0f; y2L = 0f
-        x1R = 0f; x2R = 0f; y1R = 0f; y2R = 0f
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -1299,30 +1227,10 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         if (!isDolbyAtmos) {
             out.put(inputBuffer)
         } else {
-            val applyShelf = isEac3Joc && outputAudioFormat.channelCount == 2
-
-            if (applyShelf) {
-                while (inputBuffer.remaining() >= 4) {
-                    var sampleL = inputBuffer.short.toFloat() * DOLBY_HEADROOM_GAIN
-                    var sampleR = inputBuffer.short.toFloat() * DOLBY_HEADROOM_GAIN
-
-                    val outL = b0 * sampleL + b1 * x1L + b2 * x2L - a1 * y1L - a2 * y2L
-                    x2L = x1L; x1L = sampleL; y2L = y1L; y1L = outL
-                    sampleL = outL
-
-                    val outR = b0 * sampleR + b1 * x1R + b2 * x2R - a1 * y1R - a2 * y2R
-                    x2R = x1R; x1R = sampleR; y2R = y1R; y2R = outR
-                    sampleR = outR
-
-                    out.putShort(sampleL.roundToInt().coerceIn(-32768, 32767).toShort())
-                    out.putShort(sampleR.roundToInt().coerceIn(-32768, 32767).toShort())
-                }
-            } else {
-                while (inputBuffer.remaining() >= 2) {
-                    val sample = inputBuffer.short
-                    val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
-                    out.putShort(scaled)
-                }
+            while (inputBuffer.hasRemaining()) {
+                val sample = inputBuffer.short
+                val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
+                out.putShort(scaled)
             }
         }
         out.flip()
@@ -1330,8 +1238,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec que força o decodificador nativo da Dolby (c2.dolby.eac3.decoder)
- * com as chaves exigidas pela Samsung para operar em estéreo binaural limpo.
+ * Renderizador MediaCodec que força o descodificador nativo da Dolby (c2.dolby.eac3.decoder)
+ * com as chaves exigidas pela Samsung para operar em estéreo binaural limpo sem filtros artificiais.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1367,7 +1275,6 @@ private class DolbyMediaCodecAudioRenderer(
 
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
-            dolbyGainProcessor?.isEac3Joc = isEac3
             try {
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
@@ -1399,7 +1306,6 @@ private class DolbyMediaCodecAudioRenderer(
             }
         } else {
             dolbyGainProcessor?.isDolbyAtmos = false
-            dolbyGainProcessor?.isEac3Joc = false
         }
         return mediaFormat
     }
