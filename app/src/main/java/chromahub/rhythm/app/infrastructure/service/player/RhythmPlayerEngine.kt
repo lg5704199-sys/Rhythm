@@ -216,19 +216,9 @@ class RhythmPlayerEngine(
     }
 
     private fun enforceSamsungSoundAliveProfile() {
-        scope.launch {
-            delay(120)
-            try {
-                // Força o perfil 6 (Game1): espacialização pura sem equalizadores e sem compressores
-                audioManager.setParameters("g_effect_dolby_profile=6")
-                audioManager.setParameters("g_effect_dolby_volume_leveler=0")
-                audioManager.setParameters("g_effect_dolby_ieq=0")
-                audioManager.setParameters("g_effect_dolby_dialog_enhancer=0")
-                audioManager.setParameters("g_effect_dolby_bass_enhancer=0")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to enforce Dolby Profile 6 parameters", e)
-            }
-        }
+        // Intencionalmente vazio: não chamamos audioManager.setParameters para
+        // impedir que o daemon SoundAlive acorde e dispute perfis no AudioPolicyManager.
+        // Toda a renderização binaural limpa é feita diretamente pelo decodificador c2.dolby.eac3.decoder via MediaFormat.
     }
 
     private val masterPlayerListener = object : Player.Listener {
@@ -237,10 +227,6 @@ class RhythmPlayerEngine(
                 requestAudioFocus()
                 if (transitionRunning && ::playerB.isInitialized && playerB.playbackState != Player.STATE_ENDED) {
                     playerB.playWhenReady = true
-                }
-                val currentMime = (masterPlayer as? ExoPlayer)?.audioFormat?.sampleMimeType.orEmpty().lowercase()
-                if (currentMime.contains("eac3") || currentMime.contains("ac4")) {
-                    enforceSamsungSoundAliveProfile()
                 }
             } else {
                 if (transitionRunning && ::playerB.isInitialized) {
@@ -267,7 +253,6 @@ class RhythmPlayerEngine(
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
-                    enforceSamsungSoundAliveProfile()
                 } else {
                     val info = ReplayGainUtil.parse(format)
                     masterPlayer.currentMediaItem?.mediaId?.let { id ->
@@ -702,7 +687,7 @@ class RhythmPlayerEngine(
         val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
             .setDataSourceFactory(resolvingDataSourceFactory)
 
-        // Desativa faixas de vídeo e imagem para não interferirem no Seek da faixa
+        // Desativa faixas de vídeo e imagem para não sequestrarem a timeline do áudio
         val trackSelectionParameters = buildTrackSelectionParameters(
             TrackSelectionParameters.DEFAULT,
             appSettings
@@ -921,7 +906,6 @@ class RhythmPlayerEngine(
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
-            enforceSamsungSoundAliveProfile()
         } else {
             val cachedTags = ReplayGainCache.get(mediaIdToSync)
             if (cachedTags != null) {
@@ -1226,7 +1210,6 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
         val out = replaceOutputBuffer(remaining)
-        // Passa os bytes do decodificador diretamente sem alterar uma única amostra
         out.put(inputBuffer)
         out.flip()
     }
