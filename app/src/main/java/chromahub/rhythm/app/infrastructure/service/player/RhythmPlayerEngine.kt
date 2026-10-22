@@ -221,9 +221,14 @@ class RhythmPlayerEngine(
         scope.launch {
             delay(120)
             try {
+                // Desativa o Volume Leveler, o IEQ (+13 dB) e o compressor no sistema Samsung
                 audioManager.setParameters("g_effect_dolby_volume_leveler=0")
+                audioManager.setParameters("g_effect_dolby_ieq=0")
+                audioManager.setParameters("g_effect_dolby_dialog_enhancer=0")
+                audioManager.setParameters("g_effect_dolby_bass_enhancer=0")
+                audioManager.setParameters("g_effect_dolby_profile=5") // Profile 5 = Off (neutro) no dax-default
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to disable SoundAlive volume leveler", e)
+                Log.w(TAG, "Failed to neutralize Samsung SoundAlive effects", e)
             }
         }
     }
@@ -688,7 +693,7 @@ class RhythmPlayerEngine(
             }
         )
 
-        // Extratores com suporte a tabelas de edição de MP4 sem flags de câmara SEF
+        // Extratores com suporte a tabelas de edição de MP4/M4A limpos
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -699,6 +704,7 @@ class RhythmPlayerEngine(
         val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
             .setDataSourceFactory(resolvingDataSourceFactory)
 
+        // Desativa faixas de vídeo e imagem para não interferirem no Seek da faixa
         val trackSelectionParameters = buildTrackSelectionParameters(
             TrackSelectionParameters.DEFAULT,
             appSettings
@@ -1098,7 +1104,6 @@ class RhythmPlayerEngine(
         baseParameters: TrackSelectionParameters,
         appSettings: AppSettings
     ): TrackSelectionParameters {
-        // Bloqueia faixas de vídeo e imagem para não sequestrarem a timeline do áudio
         val builder = baseParameters.buildUpon()
             .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
             .setTrackTypeDisabled(C.TRACK_TYPE_IMAGE, true)
@@ -1201,9 +1206,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador de áudio PCM robusto e linear para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
- * Aplica exclusivamente o headroom gain (-4 dB / 0.631f) para compensar a atenuação de -14 dB da Samsung,
- * eliminando distorções de saturação sem gerar desvios de fase nem cancelamento acústico nos graves.
+ * Processador PCM linear e transparente para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
+ * Aplica exclusivamente o headroom gain linear (-4 dB / 0.631f) para compensar os -14 dB forçados
+ * pelo sistema, eliminando distorções de inter-sample peaks sem introduzir cancelamento de fase nem alterar o balanço dos graves.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1238,8 +1243,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec que força o descodificador nativo da Dolby (c2.dolby.eac3.decoder)
- * com as chaves exigidas pela Samsung para operar em estéreo binaural limpo sem filtros artificiais.
+ * Renderizador MediaCodec que força o decodificador nativo da Dolby (c2.dolby.eac3.decoder)
+ * a operar em estéreo binaural limpo, desativando IEQ, niveladores e efeitos dinâmicos que estragam o áudio.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1276,18 +1281,30 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
+                // Força saída em 2 canais binaurais decodificados diretamente do fluxo JOC
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
 
-                mediaFormat.setInteger("vendor.dolby.profile.value", 2)
-                mediaFormat.setInteger("vendor.dolby.dap.profile.value", 2)
-                mediaFormat.setInteger("vendor.dolby.profile-index.value", 2)
+                // Seleciona o perfil 5 (Off no dax-default) ou limpa os efeitos internos do perfil
+                mediaFormat.setInteger("vendor.dolby.profile.value", 5)
+                mediaFormat.setInteger("vendor.dolby.dap.profile.value", 5)
+                mediaFormat.setInteger("vendor.dolby.profile-index.value", 5)
 
+                // Desativa o IEQ (+13.6 dB de boost forçado em frequências baixas/médias)
+                mediaFormat.setInteger("vendor.dolby.dap.ieq.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.ieq.amount", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
+
+                // Desativa o Volume Leveler (elimina a queda brusca de volume aos 2-3 segundos)
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.amount", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.dvla.value", 0)
+
+                // Desativa reforços artificiais de grave e compressões dinâmicas
                 mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
@@ -1296,9 +1313,13 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.dap.vmb.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.geon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
+
+                // Desativa corte de picos por DRC
+                mediaFormat.setInteger("vendor.dolby.drc.mode", 0)
+                mediaFormat.setInteger("vendor.dolby.drc.cut", 0)
+                mediaFormat.setInteger("vendor.dolby.drc.boost", 0)
 
                 Log.d(DOLBY_TAG, "Dolby MediaFormat preparado em modo estéreo binaural limpo.")
             } catch (e: Exception) {
