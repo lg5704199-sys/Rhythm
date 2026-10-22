@@ -73,7 +73,6 @@ import chromahub.rhythm.app.util.calculateVolumeOut
 import chromahub.rhythm.app.util.envelope
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
-import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -91,7 +90,6 @@ import kotlinx.coroutines.runBlocking
 private const val DOLBY_ACTIVE_DEVICE = 2
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
-private const val DOLBY_HEADROOM_GAIN = 0.631f
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -221,14 +219,14 @@ class RhythmPlayerEngine(
         scope.launch {
             delay(120)
             try {
-                // Desativa o Volume Leveler, o IEQ (+13 dB) e o compressor no sistema Samsung
+                // Força o perfil 6 (Game1): espacialização pura sem equalizadores e sem compressores
+                audioManager.setParameters("g_effect_dolby_profile=6")
                 audioManager.setParameters("g_effect_dolby_volume_leveler=0")
                 audioManager.setParameters("g_effect_dolby_ieq=0")
                 audioManager.setParameters("g_effect_dolby_dialog_enhancer=0")
                 audioManager.setParameters("g_effect_dolby_bass_enhancer=0")
-                audioManager.setParameters("g_effect_dolby_profile=5") // Profile 5 = Off (neutro) no dax-default
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to neutralize Samsung SoundAlive effects", e)
+                Log.w(TAG, "Failed to enforce Dolby Profile 6 parameters", e)
             }
         }
     }
@@ -1206,9 +1204,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador PCM linear e transparente para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
- * Aplica exclusivamente o headroom gain linear (-4 dB / 0.631f) para compensar os -14 dB forçados
- * pelo sistema, eliminando distorções de inter-sample peaks sem introduzir cancelamento de fase nem alterar o balanço dos graves.
+ * Processador PCM 100% linear e transparente (Bit-Perfect Passthrough).
+ * Não aplica filtros, nem atenuações, nem equalização artificial.
+ * O áudio espacial gerado pelo decodificador Dolby vai direto para a saída.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1228,23 +1226,16 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
         val out = replaceOutputBuffer(remaining)
-
-        if (!isDolbyAtmos) {
-            out.put(inputBuffer)
-        } else {
-            while (inputBuffer.hasRemaining()) {
-                val sample = inputBuffer.short
-                val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
-                out.putShort(scaled)
-            }
-        }
+        // Passa os bytes do decodificador diretamente sem alterar uma única amostra
+        out.put(inputBuffer)
         out.flip()
     }
 }
 
 /**
- * Renderizador MediaCodec que força o decodificador nativo da Dolby (c2.dolby.eac3.decoder)
- * a operar em estéreo binaural limpo, desativando IEQ, niveladores e efeitos dinâmicos que estragam o áudio.
+ * Renderizador MediaCodec configurado no Perfil 6 (Game1):
+ * Mantém estritamente a virtualização binaural espacial da Dolby nos fones,
+ * desativando qualquer equalizador (IEQ/Gráfico), compressor (Volume Leveler), ducking ou DRC.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1281,47 +1272,52 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // Força saída em 2 canais binaurais decodificados diretamente do fluxo JOC
+                // Configuração básica de saída estéreo binaural para fones
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-                mediaFormat.setInteger("vendor.dolby.output-level.value", -18)
 
-                // Seleciona o perfil 5 (Off no dax-default) ou limpa os efeitos internos do perfil
-                mediaFormat.setInteger("vendor.dolby.profile.value", 5)
-                mediaFormat.setInteger("vendor.dolby.dap.profile.value", 5)
-                mediaFormat.setInteger("vendor.dolby.profile-index.value", 5)
+                // Força o Perfil 6 (Game1): o perfil com virtualizador ativo e sem compressão/IEQ
+                mediaFormat.setInteger("vendor.dolby.profile.value", 6)
+                mediaFormat.setInteger("vendor.dolby.dap.profile.value", 6)
+                mediaFormat.setInteger("vendor.dolby.profile-index.value", 6)
 
-                // Desativa o IEQ (+13.6 dB de boost forçado em frequências baixas/médias)
+                // 1. ESPACIALIZAÇÃO BINAURAL (A única coisa que fica ATIVA)
+                mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
+                mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
+
+                // 2. EQUALIZADORES TOTALMENTE DESATIVADOS (Sem coloração de som)
                 mediaFormat.setInteger("vendor.dolby.dap.ieq.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.ieq.amount", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.geon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
 
-                // Desativa o Volume Leveler (elimina a queda brusca de volume aos 2-3 segundos)
+                // 3. NORMALIZAÇÃO E COMPRESSORES DESATIVADOS (Sem queda de volume aos 3s)
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.amount", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvla.value", 0)
 
-                // Desativa reforços artificiais de grave e compressões dinâmicas
-                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
+                // 4. SEM ALTERAÇÃO DE VOZ OU DUCKING DE INSTRUMENTOS
+                mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.dialog-enhancer.ducking", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.surround-boost", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dsb.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.vmb.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.geon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
 
-                // Desativa corte de picos por DRC
+                // 5. SEM CORTE DE DINÂMICA (DRC bypass total)
                 mediaFormat.setInteger("vendor.dolby.drc.mode", 0)
+                mediaFormat.setInteger("vendor.dolby.eac3.drc-mode", 0)
                 mediaFormat.setInteger("vendor.dolby.drc.cut", 0)
                 mediaFormat.setInteger("vendor.dolby.drc.boost", 0)
 
-                Log.d(DOLBY_TAG, "Dolby MediaFormat preparado em modo estéreo binaural limpo.")
+                Log.d(DOLBY_TAG, "Dolby MediaFormat em modo Binaural Puro (Virtualizador ON, EQ OFF, Compressor OFF).")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
