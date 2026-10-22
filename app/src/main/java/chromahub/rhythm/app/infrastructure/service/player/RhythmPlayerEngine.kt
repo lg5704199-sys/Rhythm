@@ -1,4 +1,3 @@
-
 /*
  * SPDX-FileCopyrightText: 2024-2026 Anjishnu Nandi <https://github.com/cromaguy>
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -52,7 +51,10 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.video.VideoRendererEventListener
 import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.mp4.FragmentedMp4Extractor
+import androidx.media3.extractor.mp4.Mp4Extractor
 import androidx.media3.extractor.mp3.Mp3Extractor
 import androidx.media3.extractor.ts.AdtsExtractor
 import chromahub.rhythm.app.core.device.DeviceCapabilitiesProvider
@@ -267,7 +269,6 @@ class RhythmPlayerEngine(
                 val isDolby = isEac3 || isAc4
 
                 activeDolbyGainProcessor?.isDolbyAtmos = isDolby
-                activeDolbyGainProcessor?.isEac3Joc = isEac3
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
@@ -475,7 +476,6 @@ class RhythmPlayerEngine(
         replayGainProcessor: ReplayGainAudioProcessor? = null,
         dolbyGainProcessor: DolbyGainAudioProcessor? = null
     ): ExoPlayer {
-        // Buffers otimizados: carregamento rápido ao dar seek sem congelar a reprodução
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 15_000,
@@ -543,6 +543,20 @@ class RhythmPlayerEngine(
         }
 
         val renderersFactory = object : DefaultRenderersFactory(context) {
+            // BLOQUEIA RENDERIZADORES DE VÍDEO: Impede que capas embutidas como vídeo travem o seek da música
+            override fun buildVideoRenderers(
+                context: Context,
+                extensionRendererMode: Int,
+                mediaCodecSelector: MediaCodecSelector,
+                enableDecoderFallback: Boolean,
+                eventHandler: Handler,
+                eventListener: VideoRendererEventListener,
+                maxDroppedFramesToNotify: Int,
+                out: ArrayList<Renderer>
+            ) {
+                // Deixa vazio intencionalmente. O app é exclusivamente de áudio.
+            }
+
             override fun buildAudioRenderers(
                 context: Context,
                 extensionRendererMode: Int,
@@ -700,17 +714,29 @@ class RhythmPlayerEngine(
             }
         )
 
+        // Configuração de extração otimizada para contentores MP4/M4A com tabelas de índice estendidas
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
+            .setMp4ExtractorFlags(Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS)
+            .setFragmentedMp4ExtractorFlags(
+                FragmentedMp4Extractor.FLAG_WORKAROUND_IGNORE_TFDT_BOX or
+                FragmentedMp4Extractor.FLAG_WORKAROUND_EVERY_VIDEO_FRAME_IS_SYNC_FRAME
+            )
             .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING)
             .setAdtsExtractorFlags(AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING)
 
         val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
             .setDataSourceFactory(resolvingDataSourceFactory)
 
-        val defaultParams = TrackSelectionParameters.DEFAULT
-        val trackSelectionParameters = buildTrackSelectionParameters(defaultParams, appSettings)
+        // Força a desativação de qualquer faixa de vídeo ou imagem para não sequestrar o mapa de busca da música
+        val trackSelectionParameters = buildTrackSelectionParameters(
+            TrackSelectionParameters.DEFAULT.buildUpon()
+                .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+                .setTrackTypeDisabled(C.TRACK_TYPE_IMAGE, true)
+                .build(),
+            appSettings
+        )
 
         val player = ExoPlayer.Builder(context, renderersFactory)
             .setLoadControl(loadControl)
@@ -724,7 +750,6 @@ class RhythmPlayerEngine(
                 setHandleAudioBecomingNoisy(true)
                 setWakeMode(C.WAKE_MODE_LOCAL)
                 setSkipSilenceEnabled(appSettings.skipSilenceEnabled.value)
-                // CLOSEST_SYNC permite que ficheiros E-AC-3 JOC a 768 kbps saltem de tempo de imediato
                 setSeekParameters(SeekParameters.CLOSEST_SYNC)
                 playWhenReady = false
                 preferredAudioDevice?.let { dev ->
@@ -933,7 +958,6 @@ class RhythmPlayerEngine(
         val isDolby = isEac3 || isAc4
 
         activeDolbyGainProcessor?.isDolbyAtmos = isDolby
-        activeDolbyGainProcessor?.isEac3Joc = isEac3
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
@@ -1222,10 +1246,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador de áudio PCM dedicado para faixas em Dolby Atmos (E-AC-3 JOC / AC-4).
- * 1. Aplica headroom gain de -4 dB (fator 0.631) para compensar a saída de -14 dB da Samsung e cravar -18 LKFS.
- * 2. Em faixas E-AC-3 JOC, atenua os subgraves (< 100 Hz em -5 dB) usando modelagem suave (smooth low-cut)
- *    para neutralizar o ganho de cinema de +10 dB do canal LFE (.1) sem risco de descontinuidade matemática.
+ * Processador PCM de áudio transparente para faixas Dolby Atmos (E-AC-3 JOC / AC-4).
+ * Aplica exclusivamente o headroom gain linear (-4 dB / 0.631f) para compensar os -14 dB da Samsung,
+ * eliminando distorções de inter-sample peaks sem introduzir cancelamento de fase nem alterar o balanço dos graves.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1233,30 +1256,12 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     @Volatile
     var isDolbyAtmos: Boolean = false
 
-    @Volatile
-    var isEac3Joc: Boolean = false
-
-    private var lowL: Float = 0f
-    private var lowR: Float = 0f
-
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
-            lowL = 0f
-            lowR = 0f
             inputAudioFormat
         } else {
             AudioProcessor.AudioFormat.NOT_SET
         }
-    }
-
-    override fun onFlush() {
-        lowL = 0f
-        lowR = 0f
-    }
-
-    override fun onReset() {
-        lowL = 0f
-        lowR = 0f
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -1267,37 +1272,10 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         if (!isDolbyAtmos) {
             out.put(inputBuffer)
         } else {
-            val cutLfe = isEac3Joc
-            val channelCount = outputAudioFormat.channelCount
-
-            if (cutLfe && channelCount == 2) {
-                // Filtro shelf de 100 Hz suave: atenua 5 dB de subgraves do LFE no sinal estéreo
-                // beta = 2 * PI * 100 / 48000 ≈ 0.013f
-                val beta = 0.013f
-                while (inputBuffer.remaining() >= 4) {
-                    val rawL = inputBuffer.short.toFloat()
-                    val rawR = inputBuffer.short.toFloat()
-
-                    lowL += beta * (rawL - lowL)
-                    lowR += beta * (rawR - lowR)
-
-                    // Subtrai 44% da componente subgrave (resulta em -5 dB abaixo de 100 Hz)
-                    val shapedL = rawL - 0.44f * lowL
-                    val shapedR = rawR - 0.44f * lowR
-
-                    val outL = (shapedL * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
-                    val outR = (shapedR * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
-
-                    out.putShort(outL)
-                    out.putShort(outR)
-                }
-            } else {
-                // Apenas atenuação de ganho (-4 dB) para AC-4 IMS ou faixas com outros canais
-                while (inputBuffer.remaining() >= 2) {
-                    val sample = inputBuffer.short
-                    val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
-                    out.putShort(scaled)
-                }
+            while (inputBuffer.remaining() >= 2) {
+                val sample = inputBuffer.short
+                val scaled = (sample * DOLBY_HEADROOM_GAIN).roundToInt().coerceIn(-32768, 32767).toShort()
+                out.putShort(scaled)
             }
         }
         out.flip()
@@ -1305,7 +1283,7 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec que força o descodificador nativo da Dolby (c2.dolby.eac3.decoder)
+ * Renderizador MediaCodec que força o decodificador nativo da Dolby (c2.dolby.eac3.decoder)
  * com as chaves exigidas pela Samsung para operar em estéreo binaural limpo.
  */
 @OptIn(UnstableApi::class)
@@ -1342,7 +1320,6 @@ private class DolbyMediaCodecAudioRenderer(
 
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
-            dolbyGainProcessor?.isEac3Joc = isEac3
             try {
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
@@ -1374,7 +1351,6 @@ private class DolbyMediaCodecAudioRenderer(
             }
         } else {
             dolbyGainProcessor?.isDolbyAtmos = false
-            dolbyGainProcessor?.isEac3Joc = false
         }
         return mediaFormat
     }
