@@ -73,6 +73,7 @@ import chromahub.rhythm.app.util.calculateVolumeOut
 import chromahub.rhythm.app.util.envelope
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -90,6 +91,9 @@ import kotlinx.coroutines.runBlocking
 private const val DOLBY_ACTIVE_DEVICE = 2
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
+
+// Ganho estático equivalente a -4 dB (10^(-4/20)), sem corte dinâmico nem filtros
+private const val DOLBY_PREAMP_MINUS_4DB = 0.63095734f
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -218,7 +222,7 @@ class RhythmPlayerEngine(
     private fun enforceSamsungSoundAliveProfile() {
         // Intencionalmente vazio: não chamamos audioManager.setParameters para
         // impedir que o daemon SoundAlive acorde e dispute perfis no AudioPolicyManager.
-        // Toda a renderização binaural limpa é feita diretamente pelo decodificador c2.dolby.eac3.decoder via MediaFormat.
+        // A virtualização binaural limpa e o pré-amp de -4 dB atuam diretamente no app.
     }
 
     private val masterPlayerListener = object : Player.Listener {
@@ -687,7 +691,7 @@ class RhythmPlayerEngine(
         val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
             .setDataSourceFactory(resolvingDataSourceFactory)
 
-        // Desativa faixas de vídeo e imagem para não sequestrarem a timeline do áudio
+        // Desativa faixas de vídeo e imagem para não interferirem no Seek da faixa
         val trackSelectionParameters = buildTrackSelectionParameters(
             TrackSelectionParameters.DEFAULT,
             appSettings
@@ -1188,9 +1192,11 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador PCM 100% linear e transparente (Bit-Perfect Passthrough).
- * Não aplica filtros, nem atenuações, nem equalização artificial.
- * O áudio espacial gerado pelo decodificador Dolby vai direto para a saída.
+ * Processador PCM linear e transparente com atenuação estática de pré-amplificação (-4 dB).
+ * Atua diretamente após a decodificação de AC-4 e E-AC-3 JOC.
+ * Aplica um fator de escala linear de 0.63095734f a cada amostra de 16 bits,
+ * eliminando distorção por inter-sample peaks sem introduzir equalização de frequência,
+ * sem compressão dinâmica (Volume Leveler) e sem rotação de fase.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1210,7 +1216,16 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
         val out = replaceOutputBuffer(remaining)
-        out.put(inputBuffer)
+
+        if (!isDolbyAtmos) {
+            out.put(inputBuffer)
+        } else {
+            while (inputBuffer.hasRemaining()) {
+                val sample = inputBuffer.short
+                val scaled = (sample * DOLBY_PREAMP_MINUS_4DB).roundToInt().coerceIn(-32768, 32767).toShort()
+                out.putShort(scaled)
+            }
+        }
         out.flip()
     }
 }
@@ -1261,7 +1276,7 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
 
-                // Força o Perfil 6 (Game1): o perfil com virtualizador ativo e sem compressão/IEQ
+                // Força o Perfil 6 (Game1): virtualizador ativo com resposta neutra
                 mediaFormat.setInteger("vendor.dolby.profile.value", 6)
                 mediaFormat.setInteger("vendor.dolby.dap.profile.value", 6)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", 6)
@@ -1300,7 +1315,7 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.drc.cut", 0)
                 mediaFormat.setInteger("vendor.dolby.drc.boost", 0)
 
-                Log.d(DOLBY_TAG, "Dolby MediaFormat em modo Binaural Puro (Virtualizador ON, EQ OFF, Compressor OFF).")
+                Log.d(DOLBY_TAG, "Dolby MediaFormat em modo Binaural Puro com Pré-Amp -4 dB (Virtualizador ON, EQ OFF, Leveler OFF).")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
             }
