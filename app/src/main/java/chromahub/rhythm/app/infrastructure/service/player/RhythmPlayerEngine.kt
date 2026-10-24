@@ -13,6 +13,7 @@ import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
@@ -92,7 +93,7 @@ private const val DOLBY_ACTIVE_DEVICE = 2
 private const val DOLBY_DAX_STATE = 1
 private const val DOLBY_TAG = "RhythmDolby"
 
-// Ganho estático equivalente a -4 dB (10^(-4/20)), sem corte dinâmico nem filtros
+// Ganho estático equivalente a -4 dB (10^(-4/20)), sem filtros de fase nem compressão
 private const val DOLBY_PREAMP_MINUS_4DB = 0.63095734f
 
 @OptIn(UnstableApi::class)
@@ -142,6 +143,23 @@ class RhythmPlayerEngine(
     private var playerBDecoderName: String = ""
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val dolbyHandler = Handler(Looper.getMainLooper())
+
+    private fun enforceSamsungSoundAliveProfile() {
+        val cmd = "g_effect_dolby_enable=1;g_effect_dolby_profile=6;volume_leveler=0;ieq=0"
+        longArrayOf(400, 1500, 3000).forEach { delayMs ->
+            dolbyHandler.postDelayed({
+                if (activeDolbyGainProcessor?.isDolbyAtmos == true && (masterPlayer.isPlaying || masterPlayer.playWhenReady)) {
+                    try {
+                        audioManager.setParameters(cmd)
+                        Log.d(DOLBY_TAG, "Tentativa de sobrepor Perfil 6 apos ${delayMs}ms")
+                    } catch (e: Exception) {
+                        Log.w(DOLBY_TAG, "Falha ao enviar setParameters", e)
+                    }
+                }
+            }, delayMs)
+        }
+    }
 
     private val analyticsListenerA = object : AnalyticsListener {
         override fun onAudioDecoderInitialized(
@@ -155,6 +173,7 @@ class RhythmPlayerEngine(
             if (format != null && masterPlayer === playerA) {
                 _currentEngineFormat.value = EngineAudioFormat(format, decoderName)
             }
+            enforceSamsungSoundAliveProfile()
         }
 
         override fun onAudioInputFormatChanged(
@@ -180,6 +199,7 @@ class RhythmPlayerEngine(
             if (format != null && masterPlayer === playerB) {
                 _currentEngineFormat.value = EngineAudioFormat(format, decoderName)
             }
+            enforceSamsungSoundAliveProfile()
         }
 
         override fun onAudioInputFormatChanged(
@@ -214,15 +234,10 @@ class RhythmPlayerEngine(
                     isFocusLossPause = false
                     playerA.playWhenReady = true
                     if (transitionRunning) playerB.playWhenReady = true
+                    enforceSamsungSoundAliveProfile()
                 }
             }
         }
-    }
-
-    private fun enforceSamsungSoundAliveProfile() {
-        // Intencionalmente vazio: não chamamos audioManager.setParameters para
-        // impedir que o daemon SoundAlive acorde e dispute perfis no AudioPolicyManager.
-        // A virtualização binaural limpa e o pré-amp de -4 dB atuam diretamente no app.
     }
 
     private val masterPlayerListener = object : Player.Listener {
@@ -232,6 +247,7 @@ class RhythmPlayerEngine(
                 if (transitionRunning && ::playerB.isInitialized && playerB.playbackState != Player.STATE_ENDED) {
                     playerB.playWhenReady = true
                 }
+                enforceSamsungSoundAliveProfile()
             } else {
                 if (transitionRunning && ::playerB.isInitialized) {
                     playerB.playWhenReady = false
@@ -257,6 +273,7 @@ class RhythmPlayerEngine(
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
+                    enforceSamsungSoundAliveProfile()
                 } else {
                     val info = ReplayGainUtil.parse(format)
                     masterPlayer.currentMediaItem?.mediaId?.let { id ->
@@ -910,6 +927,7 @@ class RhythmPlayerEngine(
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
+            enforceSamsungSoundAliveProfile()
         } else {
             val cachedTags = ReplayGainCache.get(mediaIdToSync)
             if (cachedTags != null) {
