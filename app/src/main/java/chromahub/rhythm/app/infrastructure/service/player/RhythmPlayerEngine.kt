@@ -432,12 +432,18 @@ class RhythmPlayerEngine(
                     updateTrackSelectionParameters()
                 }
             }
-            launch { appSettings.gaplessPlayback.collect { updateTrackSelectionParameters() } }
+                       launch { appSettings.gaplessPlayback.collect { updateTrackSelectionParameters() } }
             launch { appSettings.skipSilenceEnabled.collect { updateTrackSelectionParameters() } }
+        }
+
+        // Adicione aqui:
+        DolbyProfileProbe.registerReceiver(context, audioManager) {
+            masterPlayer.isPlaying && activeDolbyGainProcessor?.isDolbyAtmos == true
         }
     }
 
     private fun requestAudioFocus() {
+        
         if (audioFocusRequest != null) return
 
         val attributes = android.media.AudioAttributes.Builder()
