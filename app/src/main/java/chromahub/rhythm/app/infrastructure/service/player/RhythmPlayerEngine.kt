@@ -143,21 +143,20 @@ class RhythmPlayerEngine(
     private var playerBDecoderName: String = ""
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private val dolbyHandler = Handler(Looper.getMainLooper())
 
-    private fun enforceSamsungSoundAliveProfile() {
-        val cmd = "g_effect_dolby_enable=1;g_effect_dolby_profile=6;volume_leveler=0;ieq=0"
-        longArrayOf(400, 1500, 3000).forEach { delayMs ->
-            dolbyHandler.postDelayed({
-                if (activeDolbyGainProcessor?.isDolbyAtmos == true && (masterPlayer.isPlaying || masterPlayer.playWhenReady)) {
-                    try {
-                        audioManager.setParameters(cmd)
-                        Log.d(DOLBY_TAG, "Tentativa de sobrepor Perfil 6 apos ${delayMs}ms")
-                    } catch (e: Exception) {
-                        Log.w(DOLBY_TAG, "Falha ao enviar setParameters", e)
-                    }
-                }
-            }, delayMs)
+    /**
+     * BLOQUEIO ATIVO: Força o subsistema de efeitos da Samsung para o Perfil 5 (Off).
+     * O Perfil 5 é o bypass oficial de hardware da Samsung: desativa o DlbEffectContext (enabled=0),
+     * elimina o Intelligent EQ (+13.6 dB) e desativa completamente o Volume Leveler.
+     */
+    private fun neutralizeSamsungDolby() {
+        if (activeDolbyGainProcessor?.isDolbyAtmos == true) {
+            try {
+                audioManager.setParameters("g_effect_dolby_enable=0;g_effect_dolby_profile=5;g_effect_game_dolby_enable=0;volume_leveler=0;ieq=0")
+                Log.d(DOLBY_TAG, "Bloqueio ativo: Efeitos de sistema da Samsung neutralizados (Perfil 5 / Bypass).")
+            } catch (e: Exception) {
+                Log.w(DOLBY_TAG, "Falha ao enviar parâmetros de neutralização", e)
+            }
         }
     }
 
@@ -173,7 +172,7 @@ class RhythmPlayerEngine(
             if (format != null && masterPlayer === playerA) {
                 _currentEngineFormat.value = EngineAudioFormat(format, decoderName)
             }
-            enforceSamsungSoundAliveProfile()
+            neutralizeSamsungDolby()
         }
 
         override fun onAudioInputFormatChanged(
@@ -199,7 +198,7 @@ class RhythmPlayerEngine(
             if (format != null && masterPlayer === playerB) {
                 _currentEngineFormat.value = EngineAudioFormat(format, decoderName)
             }
-            enforceSamsungSoundAliveProfile()
+            neutralizeSamsungDolby()
         }
 
         override fun onAudioInputFormatChanged(
@@ -234,7 +233,7 @@ class RhythmPlayerEngine(
                     isFocusLossPause = false
                     playerA.playWhenReady = true
                     if (transitionRunning) playerB.playWhenReady = true
-                    enforceSamsungSoundAliveProfile()
+                    neutralizeSamsungDolby()
                 }
             }
         }
@@ -247,7 +246,7 @@ class RhythmPlayerEngine(
                 if (transitionRunning && ::playerB.isInitialized && playerB.playbackState != Player.STATE_ENDED) {
                     playerB.playWhenReady = true
                 }
-                enforceSamsungSoundAliveProfile()
+                neutralizeSamsungDolby()
             } else {
                 if (transitionRunning && ::playerB.isInitialized) {
                     playerB.playWhenReady = false
@@ -273,7 +272,7 @@ class RhythmPlayerEngine(
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
-                    enforceSamsungSoundAliveProfile()
+                    neutralizeSamsungDolby()
                 } else {
                     val info = ReplayGainUtil.parse(format)
                     masterPlayer.currentMediaItem?.mediaId?.let { id ->
@@ -432,18 +431,12 @@ class RhythmPlayerEngine(
                     updateTrackSelectionParameters()
                 }
             }
-                       launch { appSettings.gaplessPlayback.collect { updateTrackSelectionParameters() } }
+            launch { appSettings.gaplessPlayback.collect { updateTrackSelectionParameters() } }
             launch { appSettings.skipSilenceEnabled.collect { updateTrackSelectionParameters() } }
-        }
-
-        // Adicione aqui:
-        DolbyProfileProbe.registerReceiver(context, audioManager) {
-            masterPlayer.isPlaying && activeDolbyGainProcessor?.isDolbyAtmos == true
         }
     }
 
     private fun requestAudioFocus() {
-        
         if (audioFocusRequest != null) return
 
         val attributes = android.media.AudioAttributes.Builder()
@@ -662,10 +655,12 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
+        // BLOQUEIO DO SISTEMA: SPATIALIZATION_BEHAVIOR_NEVER impede formalmente
+        // que o Spatializer e o DAP da Samsung anexem efeitos globais neste AudioTrack.
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
-            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_AUTO)
+            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_NEVER)
             .build()
 
         val okHttpClient = UserTrustManager.buildUserTrustingHttpClientBuilder()
@@ -703,7 +698,6 @@ class RhythmPlayerEngine(
             }
         )
 
-        // Extratores com suporte a tabelas de edição de MP4/M4A limpos
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -714,7 +708,6 @@ class RhythmPlayerEngine(
         val mediaSourceFactory = DefaultMediaSourceFactory(context, extractorsFactory)
             .setDataSourceFactory(resolvingDataSourceFactory)
 
-        // Desativa faixas de vídeo e imagem para não interferirem no Seek da faixa
         val trackSelectionParameters = buildTrackSelectionParameters(
             TrackSelectionParameters.DEFAULT,
             appSettings
@@ -933,7 +926,7 @@ class RhythmPlayerEngine(
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
-            enforceSamsungSoundAliveProfile()
+            neutralizeSamsungDolby()
         } else {
             val cachedTags = ReplayGainCache.get(mediaIdToSync)
             if (cachedTags != null) {
@@ -1216,11 +1209,10 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador PCM linear e transparente com atenuação estática de pré-amplificação (-4 dB).
- * Atua diretamente após a decodificação de AC-4 e E-AC-3 JOC.
- * Aplica um fator de escala linear de 0.63095734f a cada amostra de 16 bits,
- * eliminando distorção por inter-sample peaks sem introduzir equalização de frequência,
- * sem compressão dinâmica (Volume Leveler) e sem rotação de fase.
+ * Processador PCM com atenuação linear estática (-4 dB).
+ * Atua imediatamente após a decodificação de AC-4 e E-AC-3 JOC.
+ * Aplica o fator de escala 0.63095734f a cada amostra de 16 bits,
+ * fornecendo headroom sem distorção harmônica e sem rotação de fase.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1255,9 +1247,9 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec configurado no Perfil 6 (Game1):
- * Mantém estritamente a virtualização binaural espacial da Dolby nos fones,
- * desativando qualquer equalizador (IEQ/Gráfico), compressor (Volume Leveler), ducking ou DRC.
+ * Renderizador MediaCodec configurado para Binauralização Espacial Nativa Pura:
+ * O próprio decodificador oficial C2 renderiza os objetos Atmos em estéreo 2.0 com HRTF.
+ * Todos os filtros invasivos de equalização e compressão dinâmica estão desativados na origem.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1294,22 +1286,15 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // Configuração básica de saída estéreo binaural para fones
+                // 1. FORÇA O CODEC C2 A RENDERIZAR O ESTÉREO BINAURAL COM HRTF PARA FONES
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-
-                // Força o Perfil 6 (Game1): virtualizador ativo com resposta neutra
-                mediaFormat.setInteger("vendor.dolby.profile.value", 6)
-                mediaFormat.setInteger("vendor.dolby.dap.profile.value", 6)
-                mediaFormat.setInteger("vendor.dolby.profile-index.value", 6)
-
-                // 1. ESPACIALIZAÇÃO BINAURAL (A única coisa que fica ATIVA)
                 mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
                 mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
 
-                // 2. EQUALIZADORES TOTALMENTE DESATIVADOS (Sem coloração de som)
+                // 2. DESLIGA TODOS OS EQUALIZADORES INTERNOS (Zero coloração de frequência)
                 mediaFormat.setInteger("vendor.dolby.dap.ieq.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.ieq.amount", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
@@ -1319,13 +1304,13 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
 
-                // 3. NORMALIZAÇÃO E COMPRESSORES DESATIVADOS (Sem queda de volume aos 3s)
+                // 3. DESLIGA COMPRESSORES E LIMITADORES DINÂMICOS (Zero oscilação de volume aos 3s)
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.amount", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dvla.value", 0)
 
-                // 4. SEM ALTERAÇÃO DE VOZ OU DUCKING DE INSTRUMENTOS
+                // 4. DESLIGA ALTERAÇÃO DE VOZ E DUCKING
                 mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.dialog-enhancer.ducking", 0)
@@ -1333,15 +1318,15 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.dap.dsb.value", 0)
                 mediaFormat.setInteger("vendor.dolby.dap.vmb.value", 0)
 
-                // 5. SEM CORTE DE DINÂMICA (DRC bypass total)
+                // 5. BYPASS TOTAL DE METADADOS DRC
                 mediaFormat.setInteger("vendor.dolby.drc.mode", 0)
                 mediaFormat.setInteger("vendor.dolby.eac3.drc-mode", 0)
                 mediaFormat.setInteger("vendor.dolby.drc.cut", 0)
                 mediaFormat.setInteger("vendor.dolby.drc.boost", 0)
 
-                Log.d(DOLBY_TAG, "Dolby MediaFormat em modo Binaural Puro com Pré-Amp -4 dB (Virtualizador ON, EQ OFF, Leveler OFF).")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Binaural Nativo Puro configurado (Sem DRC, Sem IEQ, Sem Leveler).")
             } catch (e: Exception) {
-                Log.w(DOLBY_TAG, "Failed to set Dolby vendor params", e)
+                Log.w(DOLBY_TAG, "Falha ao definir parâmetros do codec Dolby", e)
             }
         } else {
             dolbyGainProcessor?.isDolbyAtmos = false
