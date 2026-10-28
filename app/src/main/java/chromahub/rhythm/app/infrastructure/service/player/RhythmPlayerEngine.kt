@@ -48,6 +48,7 @@ import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -633,9 +634,7 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
-        // BLOQUEIO TOTAL DO VIRTUALIZADOR DO DISPOSITIVO:
-        // SPATIALIZATION_BEHAVIOR_NEVER impede expressamente o AudioPolicyManager e o Spatializer
-        // do Android/Samsung de aplicarem qualquer efeito ou virtualizador de sistema neste áudio.
+        // BLOQUEIO TOTAL DO VIRTUALIZADOR DO DISPOSITIVO
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
@@ -678,10 +677,12 @@ class RhythmPlayerEngine(
             }
         )
 
+        // LEITURA ATIVA DAS EDIT LISTS (elst): Flags em 0 para decodificar encoderDelay/padding dos contêineres MP4/M4A
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
-            .setMp4ExtractorFlags(Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS)
+            .setMp4ExtractorFlags(0)
+            .setFragmentedMp4ExtractorFlags(0)
             .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_INDEX_SEEKING)
             .setAdtsExtractorFlags(AdtsExtractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING)
 
@@ -1227,8 +1228,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 
 /**
  * Renderizador MediaCodec em modo Binaural Puro:
- * O decodificador C2 converte os objetos Atmos em estéreo 2.0 espacializado para fones.
- * Todos os pós-processamentos invasivos (IEQ, Leveler, Ducking, DRC) ficam desativados na origem.
+ * Converte os objetos Atmos em estéreo 2.0 com HRTF nos fones.
+ * Reutiliza o mesmo decodificador entre faixas contínuas sem reinicializar o hardware.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1249,6 +1250,36 @@ private class DolbyMediaCodecAudioRenderer(
     eventListener,
     audioSink
 ) {
+    /**
+     * REUTILIZAÇÃO CONTÍNUA DO CODEC (GAPLESS NATIVO):
+     * Impede a destruição e reinicialização do decodificador C2 na troca de faixas Dolby.
+     * Alimenta o buffer PCM continuamente, eliminando o corte de silêncio de 100-250ms.
+     */
+    override fun canReuseCodec(
+        codecInfo: MediaCodecInfo,
+        oldFormat: androidx.media3.common.Format,
+        newFormat: androidx.media3.common.Format
+    ): DecoderReuseEvaluation {
+        val oldMime = oldFormat.sampleMimeType.orEmpty().lowercase()
+        val newMime = newFormat.sampleMimeType.orEmpty().lowercase()
+        val isOldEac3 = oldMime.contains("eac3") || oldMime.contains("ec-3") || oldFormat.codecs.orEmpty().contains("joc", ignoreCase = true)
+        val isNewEac3 = newMime.contains("eac3") || newMime.contains("ec-3") || newFormat.codecs.orEmpty().contains("joc", ignoreCase = true)
+        val isOldAc4 = oldMime.contains("ac4") || oldMime.contains("ac-4")
+        val isNewAc4 = newMime.contains("ac4") || newMime.contains("ac-4")
+
+        val canReuseDolby = (isOldEac3 && isNewEac3) || (isOldAc4 && isNewAc4)
+        if (canReuseDolby && oldFormat.sampleRate == newFormat.sampleRate) {
+            return DecoderReuseEvaluation(
+                codecInfo.name,
+                oldFormat,
+                newFormat,
+                DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION,
+                0
+            )
+        }
+        return super.canReuseCodec(codecInfo, oldFormat, newFormat)
+    }
+
     override fun getMediaFormat(
         format: androidx.media3.common.Format,
         codecMimeType: String,
@@ -1349,4 +1380,3 @@ private fun androidx.media3.common.Tracks.getFirstSelectedTrackFormatByType(trac
     }
     return null
 }
-
