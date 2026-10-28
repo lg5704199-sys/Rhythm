@@ -677,7 +677,7 @@ class RhythmPlayerEngine(
             }
         )
 
-        // LEITURA ATIVA DAS EDIT LISTS (elst): Flags em 0 para decodificar encoderDelay/padding dos contêineres MP4/M4A
+        // LEITURA ATIVA DAS EDIT LISTS (elst): Flags a 0 para descodificar encoderDelay/padding dos contentores MP4/M4A
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -1190,7 +1190,7 @@ data class EngineAudioFormat(
 
 /**
  * Processador PCM com atenuação linear de pré-amplificação (-4 dB).
- * Atua imediatamente após a decodificação de AC-4 e E-AC-3 JOC.
+ * Atua imediatamente após a descodificação de AC-4 e E-AC-3 JOC.
  * Aplica o fator de escala linear 0.63095734f a cada amostra de 16 bits,
  * fornecendo headroom sem distorção por inter-sample peaks e sem alterar a fase.
  */
@@ -1228,8 +1228,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 
 /**
  * Renderizador MediaCodec em modo Binaural Puro:
- * Converte os objetos Atmos em estéreo 2.0 com HRTF nos fones.
- * Reutiliza o mesmo decodificador entre faixas contínuas sem reinicializar o hardware.
+ * Converte os objetos Atmos em estéreo 2.0 com HRTF nos auscultadores.
+ * Reutiliza o mesmo descodificador entre faixas contínuas sem reinicializar o hardware.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1252,13 +1252,14 @@ private class DolbyMediaCodecAudioRenderer(
 ) {
     /**
      * REUTILIZAÇÃO CONTÍNUA DO CODEC (GAPLESS NATIVO):
-     * Impede a destruição e reinicialização do decodificador C2 na troca de faixas Dolby.
+     * Impede a destruição e reinicialização do descodificador C2 na troca de faixas Dolby.
      * Alimenta o buffer PCM continuamente, eliminando o corte de silêncio de 100-250ms.
      */
     override fun canReuseCodec(
         codecInfo: MediaCodecInfo,
         oldFormat: androidx.media3.common.Format,
-        newFormat: androidx.media3.common.Format
+        newFormat: androidx.media3.common.Format,
+        isSameType: Boolean
     ): DecoderReuseEvaluation {
         val oldMime = oldFormat.sampleMimeType.orEmpty().lowercase()
         val newMime = newFormat.sampleMimeType.orEmpty().lowercase()
@@ -1277,7 +1278,7 @@ private class DolbyMediaCodecAudioRenderer(
                 0
             )
         }
-        return super.canReuseCodec(codecInfo, oldFormat, newFormat)
+        return super.canReuseCodec(codecInfo, oldFormat, newFormat, isSameType)
     }
 
     override fun getMediaFormat(
@@ -1296,7 +1297,7 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // Renderização binaural espacial nativa direto no codec para fones
+                // Renderização binaural espacial nativa direto no codec para auscultadores
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
