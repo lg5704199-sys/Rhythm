@@ -89,12 +89,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
-private const val DOLBY_ACTIVE_DEVICE = 2
-private const val DOLBY_DAX_STATE = 1
+private const val DOLBY_ACTIVE_DEVICE_HEADPHONE = 8
+private const val DOLBY_DAX_STATE_INTERNAL = 0
+private const val DOLBY_OUTPUT_LEVEL_REF = -17
+private const val DOLBY_PROFILE_NEUTRAL = -1
 private const val DOLBY_TAG = "RhythmDolby"
-
-// Ganho estático equivalente a -4 dB (10^(-4/20)), sem corte de dinâmica nem filtros de fase
-private const val DOLBY_PREAMP_MINUS_4DB = 0.63095734f
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -634,7 +633,7 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
-        // BLOQUEIO TOTAL DO VIRTUALIZADOR DO DISPOSITIVO
+        // Impede que o sistema aplique virtualizador duplicado, pois o C2 já entrega áudio binaural
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
@@ -677,7 +676,7 @@ class RhythmPlayerEngine(
             }
         )
 
-        // LEITURA ATIVA DAS EDIT LISTS (elst): Flags a 0 para descodificar encoderDelay/padding dos contentores MP4/M4A
+        // Respeita as edit lists (elst) dos contentores MP4/M4A para gapless sem cortes de atraso/preenchimento
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -1189,10 +1188,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador PCM com atenuação linear de pré-amplificação (-4 dB).
- * Atua imediatamente após a descodificação de AC-4 e E-AC-3 JOC.
- * Aplica o fator de escala linear 0.63095734f a cada amostra de 16 bits,
- * fornecendo headroom sem distorção por inter-sample peaks e sem alterar a fase.
+ * Processador PCM de sinal Dolby Atmos.
+ * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) direto do decodificador C2,
+ * sem atenuação artificial, preservando a dinâmica e a amplitude original da faixa.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1212,24 +1210,16 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
         val out = replaceOutputBuffer(remaining)
-
-        if (!isDolbyAtmos) {
-            out.put(inputBuffer)
-        } else {
-            while (inputBuffer.hasRemaining()) {
-                val sample = inputBuffer.short
-                val scaled = (sample * DOLBY_PREAMP_MINUS_4DB).roundToInt().coerceIn(-32768, 32767).toShort()
-                out.putShort(scaled)
-            }
-        }
+        // Passthrough direto sem recalcular amostras
+        out.put(inputBuffer)
         out.flip()
     }
 }
 
 /**
- * Renderizador MediaCodec em modo Binaural Puro:
- * Converte os objetos Atmos em estéreo 2.0 com HRTF nos auscultadores.
- * Reutiliza o mesmo descodificador entre faixas contínuas sem reinicializar o hardware.
+ * Renderizador MediaCodec com configuração idêntica à do AMP:
+ * O decodificador C2 renderiza os objetos Atmos em estéreo binaural com HRTF
+ * para fones (Device 8, DAX State 0, Output Level -17, Profile -1).
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1252,8 +1242,7 @@ private class DolbyMediaCodecAudioRenderer(
 ) {
     /**
      * REUTILIZAÇÃO CONTÍNUA DO CODEC (GAPLESS NATIVO):
-     * Impede a destruição e reinicialização do descodificador C2 na troca de faixas Dolby.
-     * Alimenta o buffer PCM continuamente, eliminando o corte de silêncio de 100-250ms.
+     * Impede a destruição e reinicialização do decodificador C2 na troca de faixas Dolby compatíveis.
      */
     override fun canReuseCodec(
         codecInfo: MediaCodecInfo,
@@ -1297,45 +1286,21 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // Renderização binaural espacial nativa direto no codec para auscultadores
+                // Configuração comprovada no AMP para ativação da matriz HRTF interna do C2
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
-                mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE)
-                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE)
-                mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
-                mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
 
-                // Equalizador desligado
-                mediaFormat.setInteger("vendor.dolby.dap.ieq.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.ieq.amount", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.ieon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.geon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.beon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.boost", 0)
+                // Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
+                mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
 
-                // Compressor e limitadores dinâmicos desligados
-                mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.amount", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.dvle.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.dvla.value", 0)
+                // DAX State 0 = Renderização no próprio decodificador C2
+                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
 
-                // Ducking e realce de voz desligados
-                mediaFormat.setInteger("vendor.dolby.dap.dialogue-enhancer.enable", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.deon.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.dialog-enhancer.ducking", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.surround-boost", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.dsb.value", 0)
-                mediaFormat.setInteger("vendor.dolby.dap.vmb.value", 0)
+                // Nível de saída de referência padrão e perfil plano neutro
+                mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
+                mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
 
-                // DRC desligado
-                mediaFormat.setInteger("vendor.dolby.drc.mode", 0)
-                mediaFormat.setInteger("vendor.dolby.eac3.drc-mode", 0)
-                mediaFormat.setInteger("vendor.dolby.drc.cut", 0)
-                mediaFormat.setInteger("vendor.dolby.drc.boost", 0)
-
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Binaural Nativo configurado sem efeitos de sistema.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo com ganho unitário configurado.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
