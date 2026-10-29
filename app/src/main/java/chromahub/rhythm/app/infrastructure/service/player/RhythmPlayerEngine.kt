@@ -73,6 +73,7 @@ import chromahub.rhythm.app.util.calculateVolumeIn
 import chromahub.rhythm.app.util.calculateVolumeOut
 import chromahub.rhythm.app.util.envelope
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
@@ -95,6 +96,8 @@ private const val DOLBY_OUTPUT_LEVEL_REF = -17
 private const val DOLBY_PROFILE_NEUTRAL = -1
 private const val DOLBY_TAG = "RhythmDolby"
 private const val GAPLESS_TAG = "RhythmGapless"
+private const val GAP_SILENCE_THRESHOLD = 16
+private const val GAP_MIN_LOG_MS = 3.0
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -1233,17 +1236,54 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     @Volatile
     var isDolbyAtmos: Boolean = false
 
+    private var gapSampleRate = 48000
+    private var gapChannels = 2
+    private var silentFrames = 0L
+
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
+            gapSampleRate = inputAudioFormat.sampleRate
+            gapChannels = inputAudioFormat.channelCount
+            silentFrames = 0L
             inputAudioFormat
         } else {
             AudioProcessor.AudioFormat.NOT_SET
         }
     }
 
+    // Mede, em milissegundos, cada trecho de silêncio digital que passa pelo processador.
+    // Só lê o áudio, não altera nada.
+    private fun measureSilence(inputBuffer: ByteBuffer) {
+        val shorts = inputBuffer.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
+        val channels = gapChannels.coerceAtLeast(1)
+        val frames = shorts.remaining() / channels
+        for (f in 0 until frames) {
+            var silent = true
+            val base = f * channels
+            for (c in 0 until channels) {
+                if (kotlin.math.abs(shorts.get(base + c).toInt()) > GAP_SILENCE_THRESHOLD) {
+                    silent = false
+                    break
+                }
+            }
+            if (silent) {
+                silentFrames++
+            } else {
+                if (silentFrames > 0) {
+                    val ms = silentFrames * 1000.0 / gapSampleRate
+                    if (ms >= GAP_MIN_LOG_MS) {
+                        Log.w(GAPLESS_TAG, "silencio de ${ms.roundToInt()} ms terminou (frames=$silentFrames sr=$gapSampleRate dolby=$isDolbyAtmos)")
+                    }
+                }
+                silentFrames = 0L
+            }
+        }
+    }
+
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
+        measureSilence(inputBuffer)
         val out = replaceOutputBuffer(remaining)
         out.put(inputBuffer)
         out.flip()
@@ -1301,7 +1341,14 @@ private class DolbyMediaCodecAudioRenderer(
                 0
             )
         }
-        return super.canReuseCodec(codecInfo, oldFormat, newFormat, isSameType)
+        val superResult = super.canReuseCodec(codecInfo, oldFormat, newFormat, isSameType)
+        Log.w(
+            GAPLESS_TAG,
+            "canReuseCodec fora do caminho Dolby: super=${superResult.result} " +
+                "old[mime=${oldFormat.sampleMimeType} codecs=${oldFormat.codecs} sr=${oldFormat.sampleRate} ch=${oldFormat.channelCount} br=${oldFormat.bitrate} maxIn=${oldFormat.maxInputSize}] " +
+                "new[mime=${newFormat.sampleMimeType} codecs=${newFormat.codecs} sr=${newFormat.sampleRate} ch=${newFormat.channelCount} br=${newFormat.bitrate} maxIn=${newFormat.maxInputSize}]"
+        )
+        return superResult
     }
 
     override fun getMediaFormat(
