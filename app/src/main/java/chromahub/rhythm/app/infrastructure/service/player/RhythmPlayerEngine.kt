@@ -1189,7 +1189,7 @@ data class EngineAudioFormat(
 
 /**
  * Processador PCM de sinal Dolby Atmos.
- * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) direto do decodificador C2,
+ * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) direto do descodificador C2,
  * sem atenuação artificial, preservando a dinâmica e a amplitude original da faixa.
  */
 @OptIn(UnstableApi::class)
@@ -1210,16 +1210,15 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
         val out = replaceOutputBuffer(remaining)
-        // Passthrough direto sem recalcular amostras
         out.put(inputBuffer)
         out.flip()
     }
 }
 
 /**
- * Renderizador MediaCodec com configuração idêntica à do AMP:
- * O decodificador C2 renderiza os objetos Atmos em estéreo binaural com HRTF
- * para fones (Device 8, DAX State 0, Output Level -17, Profile -1).
+ * Renderizador MediaCodec configurado com os parâmetros idênticos aos do AMP:
+ * O descodificador oficial c2.dolby renderiza nativamente os objetos em estéreo binaural com HRTF
+ * para fones de ouvido (Device 8, DAX State 0, Virtualizer 1, Surround Decoder 1, Output Level -17, Profile -1).
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1242,7 +1241,7 @@ private class DolbyMediaCodecAudioRenderer(
 ) {
     /**
      * REUTILIZAÇÃO CONTÍNUA DO CODEC (GAPLESS NATIVO):
-     * Impede a destruição e reinicialização do decodificador C2 na troca de faixas Dolby compatíveis.
+     * Impede a destruição e reinicialização do descodificador C2 na troca de faixas Dolby compatíveis.
      */
     override fun canReuseCodec(
         codecInfo: MediaCodecInfo,
@@ -1286,21 +1285,23 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // Configuração comprovada no AMP para ativação da matriz HRTF interna do C2
+                // 1. Saída estéreo binaural para fones
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
 
-                // Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
+                // 2. Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
 
-                // DAX State 0 = Renderização no próprio decodificador C2
-                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
+                // 3. ATIVA O MOTOR DE ESPACIALIZAÇÃO HRTF E O PROCESSADOR DE OBJETOS DENTRO DO CODEC C2
+                mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
+                mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
 
-                // Nível de saída de referência padrão e perfil plano neutro
+                // 4. Parâmetros de referência Dolby internos
+                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
 
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo com ganho unitário configurado.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo e Surround Decoder configurados com ganho nativo.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
