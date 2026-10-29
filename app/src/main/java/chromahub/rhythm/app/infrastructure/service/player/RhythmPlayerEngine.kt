@@ -94,6 +94,7 @@ private const val DOLBY_DAX_STATE_INTERNAL = 0
 private const val DOLBY_OUTPUT_LEVEL_REF = -17
 private const val DOLBY_PROFILE_NEUTRAL = -1
 private const val DOLBY_TAG = "RhythmDolby"
+private const val GAPLESS_TAG = "RhythmGapless"
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -162,9 +163,26 @@ class RhythmPlayerEngine(
             format: androidx.media3.common.Format,
             decoderReuseEvaluation: DecoderReuseEvaluation?
         ) {
+            Log.d(GAPLESS_TAG, "player=A input format: mime=${format.sampleMimeType} sr=${format.sampleRate} ch=${format.channelCount} reuseResult=${decoderReuseEvaluation?.result}")
             if (masterPlayer === playerA) {
                 _currentEngineFormat.value = EngineAudioFormat(format, playerADecoderName)
             }
+        }
+
+        override fun onAudioUnderrun(
+            eventTime: AnalyticsListener.EventTime,
+            bufferSize: Int,
+            bufferSizeMs: Long,
+            elapsedSinceLastFeedMs: Long
+        ) {
+            Log.w(GAPLESS_TAG, "player=A underrun: bufferSizeMs=$bufferSizeMs elapsedSinceLastFeedMs=$elapsedSinceLastFeedMs pos=${eventTime.currentPlaybackPositionMs}")
+        }
+
+        override fun onAudioDecoderReleased(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String
+        ) {
+            Log.w(GAPLESS_TAG, "player=A decoder released: $decoderName pos=${eventTime.currentPlaybackPositionMs}")
         }
     }
 
@@ -187,9 +205,26 @@ class RhythmPlayerEngine(
             format: androidx.media3.common.Format,
             decoderReuseEvaluation: DecoderReuseEvaluation?
         ) {
+            Log.d(GAPLESS_TAG, "player=B input format: mime=${format.sampleMimeType} sr=${format.sampleRate} ch=${format.channelCount} reuseResult=${decoderReuseEvaluation?.result}")
             if (masterPlayer === playerB) {
                 _currentEngineFormat.value = EngineAudioFormat(format, playerBDecoderName)
             }
+        }
+
+        override fun onAudioUnderrun(
+            eventTime: AnalyticsListener.EventTime,
+            bufferSize: Int,
+            bufferSizeMs: Long,
+            elapsedSinceLastFeedMs: Long
+        ) {
+            Log.w(GAPLESS_TAG, "player=B underrun: bufferSizeMs=$bufferSizeMs elapsedSinceLastFeedMs=$elapsedSinceLastFeedMs pos=${eventTime.currentPlaybackPositionMs}")
+        }
+
+        override fun onAudioDecoderReleased(
+            eventTime: AnalyticsListener.EventTime,
+            decoderName: String
+        ) {
+            Log.w(GAPLESS_TAG, "player=B decoder released: $decoderName pos=${eventTime.currentPlaybackPositionMs}")
         }
     }
 
@@ -1286,8 +1321,8 @@ private class DolbyMediaCodecAudioRenderer(
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
                 // 1. Saída estéreo binaural para fones
-                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 8)
-                mediaFormat.setInteger("max-output-channel-count", 8)
+                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
+                mediaFormat.setInteger("max-output-channel-count", 2)
 
                 // 2. Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
