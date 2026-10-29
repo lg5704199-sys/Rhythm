@@ -633,7 +633,7 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
-        // Configura o comportamento espacial do áudio no pipeline para AUTO
+        // Permite que o hardware trate o fluxo com espacialização automática compatível
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
@@ -1087,4 +1087,263 @@ class RhythmPlayerEngine(
         appSettings: AppSettings
     ): TrackSelectionParameters {
         val builder = baseParameters.buildUpon()
-            .setTrack
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+            .setTrackTypeDisabled(C.TRACK_TYPE_IMAGE, true)
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return builder.build()
+        }
+
+        val isCrossfadeEnabled = appSettings.crossfade.value
+        val isEqualizerEnabled = appSettings.equalizerEnabled.value
+        val isReplayGainEnabled = appSettings.replayGain.value
+        val isBassBoostEnabled = appSettings.bassBoostEnabled.value
+        val isVirtualizerEnabled = appSettings.virtualizerEnabled.value
+        val isMonoAudioEnabled = appSettings.monoAudioEnabled.value
+        val isPlaybackRateModified =
+            kotlin.math.abs(appSettings.playbackSpeed.value - 1f) > 0.001f ||
+            kotlin.math.abs(appSettings.playbackPitch.value - 1f) > 0.001f
+
+        val isSkipSilenceEnabled = appSettings.skipSilenceEnabled.value
+
+        val isOffloadSupported = appSettings.isAudioOffloadActive.value &&
+            (!isCrossfadeEnabled && !isEqualizerEnabled && !isReplayGainEnabled &&
+             !isBassBoostEnabled && !isVirtualizerEnabled && !isMonoAudioEnabled &&
+             !isPlaybackRateModified && !isSkipSilenceEnabled)
+
+        val audioOffloadPreferences = TrackSelectionParameters.AudioOffloadPreferences.Builder()
+            .setAudioOffloadMode(
+                if (isOffloadSupported) {
+                    TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
+                } else {
+                    TrackSelectionParameters.AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED
+                }
+            )
+            .setIsSpeedChangeSupportRequired(true)
+            .setIsGaplessSupportRequired(appSettings.gaplessPlayback.value)
+            .build()
+
+        return builder
+            .setAudioOffloadPreferences(audioOffloadPreferences)
+            .build()
+    }
+
+    fun updatePlaybackParameters() {
+        if (!::playerA.isInitialized || !::playerB.isInitialized) return
+        val appSettings = AppSettings.getInstance(context)
+        val speed = appSettings.playbackSpeed.value.coerceIn(0.25f, 3.0f)
+        val pitch = appSettings.playbackPitch.value.coerceIn(0.5f, 2.0f)
+        val params = PlaybackParameters(speed, pitch)
+        if (playerA.playbackParameters != params) {
+            playerA.playbackParameters = params
+        }
+        if (playerB.playbackParameters != params) {
+            playerB.playbackParameters = params
+        }
+    }
+
+    fun updateTrackSelectionParameters() {
+        scope.launch(Dispatchers.Main) {
+            if (!::playerA.isInitialized || !::playerB.isInitialized) return@launch
+            val appSettings = AppSettings.getInstance(context)
+            val paramsA = buildTrackSelectionParameters(playerA.trackSelectionParameters, appSettings)
+            val paramsB = buildTrackSelectionParameters(playerB.trackSelectionParameters, appSettings)
+            if (playerA.trackSelectionParameters != paramsA) {
+                playerA.trackSelectionParameters = paramsA
+            }
+            if (playerB.trackSelectionParameters != paramsB) {
+                playerB.trackSelectionParameters = paramsB
+            }
+        }
+    }
+
+    fun release() {
+        setPauseAtEndOfMediaItems(false)
+        transitionJob?.cancel()
+        scope.cancel()
+        abandonAudioFocus()
+        if (::playerA.isInitialized) {
+            playerA.removeAnalyticsListener(analyticsListenerA)
+            playerA.removeListener(masterPlayerListener)
+            playerA.release()
+        }
+        if (::playerB.isInitialized) {
+            playerB.removeAnalyticsListener(analyticsListenerB)
+            playerB.release()
+        }
+        isReleased = true
+    }
+
+    fun getCurrentAudioFormat(): androidx.media3.common.Format? =
+        _currentEngineFormat.value?.format ?: (masterPlayer as? ExoPlayer)?.audioFormat
+
+    fun getCurrentDecoderName(): String =
+        _currentEngineFormat.value?.decoderName.orEmpty()
+}
+
+data class EngineAudioFormat(
+    val format: androidx.media3.common.Format,
+    val decoderName: String = "",
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+/**
+ * Processador PCM de sinal Dolby Atmos.
+ * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) direto do descodificador C2,
+ * sem atenuação artificial, preservando a dinâmica e a amplitude original da faixa.
+ */
+@OptIn(UnstableApi::class)
+class DolbyGainAudioProcessor : BaseAudioProcessor() {
+
+    @Volatile
+    var isDolbyAtmos: Boolean = false
+
+    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
+            inputAudioFormat
+        } else {
+            AudioProcessor.AudioFormat.NOT_SET
+        }
+    }
+
+    override fun queueInput(inputBuffer: ByteBuffer) {
+        val remaining = inputBuffer.remaining()
+        if (remaining == 0) return
+        val out = replaceOutputBuffer(remaining)
+        out.put(inputBuffer)
+        out.flip()
+    }
+}
+
+/**
+ * Renderizador MediaCodec configurado com os parâmetros idênticos aos do AMP:
+ * O descodificador oficial c2.dolby renderiza nativamente os objetos em estéreo binaural com HRTF
+ * para fones de ouvido (Device 8, DAX State 0, Virtualizer 1, Surround Decoder 1, Output Level -17, Profile -1).
+ */
+@OptIn(UnstableApi::class)
+private class DolbyMediaCodecAudioRenderer(
+    context: Context,
+    codecAdapterFactory: MediaCodecAdapter.Factory,
+    mediaCodecSelector: MediaCodecSelector,
+    enableDecoderFallback: Boolean,
+    eventHandler: Handler,
+    eventListener: AudioRendererEventListener,
+    audioSink: AudioSink,
+    private val dolbyGainProcessor: DolbyGainAudioProcessor?
+) : MediaCodecAudioRenderer(
+    context,
+    codecAdapterFactory,
+    mediaCodecSelector,
+    enableDecoderFallback,
+    eventHandler,
+    eventListener,
+    audioSink
+) {
+    /**
+     * REUTILIZAÇÃO CONTÍNUA DO CODEC (GAPLESS NATIVO):
+     * Impede a destruição e reinicialização do descodificador C2 na troca de faixas Dolby compatíveis.
+     */
+    override fun canReuseCodec(
+        codecInfo: MediaCodecInfo,
+        oldFormat: androidx.media3.common.Format,
+        newFormat: androidx.media3.common.Format,
+        isSameType: Boolean
+    ): DecoderReuseEvaluation {
+        val oldMime = oldFormat.sampleMimeType.orEmpty().lowercase()
+        val newMime = newFormat.sampleMimeType.orEmpty().lowercase()
+        val isOldEac3 = oldMime.contains("eac3") || oldMime.contains("ec-3") || oldFormat.codecs.orEmpty().contains("joc", ignoreCase = true)
+        val isNewEac3 = newMime.contains("eac3") || newMime.contains("ec-3") || newFormat.codecs.orEmpty().contains("joc", ignoreCase = true)
+        val isOldAc4 = oldMime.contains("ac4") || oldMime.contains("ac-4")
+        val isNewAc4 = newMime.contains("ac4") || newMime.contains("ac-4")
+
+        val canReuseDolby = (isOldEac3 && isNewEac3) || (isOldAc4 && isNewAc4)
+        if (canReuseDolby && oldFormat.sampleRate == newFormat.sampleRate) {
+            return DecoderReuseEvaluation(
+                codecInfo.name,
+                oldFormat,
+                newFormat,
+                DecoderReuseEvaluation.REUSE_RESULT_YES_WITHOUT_RECONFIGURATION,
+                0
+            )
+        }
+        return super.canReuseCodec(codecInfo, oldFormat, newFormat, isSameType)
+    }
+
+    override fun getMediaFormat(
+        format: androidx.media3.common.Format,
+        codecMimeType: String,
+        codecMaxInputSize: Int,
+        codecOperatingRate: Float
+    ): MediaFormat {
+        val mediaFormat = super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
+        val mime = format.sampleMimeType.orEmpty().lowercase()
+        val codecs = format.codecs.orEmpty().lowercase()
+        val isEac3 = mime.contains("eac3") || mime.contains("ec-3") || codecs.contains("joc") || codecs.contains("ec-3")
+        val isAc4 = mime.contains("ac4") || mime.contains("ac-4")
+        val isDolby = isEac3 || isAc4
+
+        if (isDolby) {
+            dolbyGainProcessor?.isDolbyAtmos = true
+            try {
+                // 1. Saída estéreo binaural para fones
+                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
+                mediaFormat.setInteger("max-output-channel-count", 2)
+
+                // 2. Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
+                mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
+
+                // 3. ATIVA O MOTOR DE ESPACIALIZAÇÃO HRTF E O PROCESSADOR DE OBJETOS DENTRO DO CODEC C2
+                mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
+                mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
+
+                // 4. Parâmetros de referência Dolby internos
+                mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
+                mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
+                mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
+
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo e Surround Decoder configurados com ganho nativo.")
+            } catch (e: Exception) {
+                Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
+            }
+        } else {
+            dolbyGainProcessor?.isDolbyAtmos = false
+        }
+        return mediaFormat
+    }
+}
+
+@OptIn(UnstableApi::class)
+private class NoDolbyRenderer(private val base: Renderer) : Renderer by base {
+    override fun getCapabilities(): RendererCapabilities = NoDolbyCapabilities(base.capabilities)
+}
+
+@OptIn(UnstableApi::class)
+private class NoDolbyCapabilities(private val base: RendererCapabilities) : RendererCapabilities by base {
+    private val blockedMimeTypes = setOf(
+        MimeTypes.AUDIO_AC3,
+        MimeTypes.AUDIO_E_AC3,
+        MimeTypes.AUDIO_E_AC3_JOC,
+        MimeTypes.AUDIO_AC4
+    )
+
+    override fun supportsFormat(format: androidx.media3.common.Format): Int {
+        return if (format.sampleMimeType in blockedMimeTypes) {
+            RendererCapabilities.create(C.FORMAT_UNSUPPORTED_TYPE)
+        } else {
+            base.supportsFormat(format)
+        }
+    }
+}
+
+private fun androidx.media3.common.Tracks.getFirstSelectedTrackFormatByType(trackType: Int): androidx.media3.common.Format? {
+    for (group in groups) {
+        if (group.type == trackType && group.isSelected) {
+            for (i in 0 until group.length) {
+                if (group.isTrackSelected(i)) {
+                    return group.getTrackFormat(i)
+                }
+            }
+        }
+    }
+    return null
+}
