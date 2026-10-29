@@ -1286,8 +1286,8 @@ private class DolbyMediaCodecAudioRenderer(
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
                 // 1. Saída estéreo binaural para fones
-                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
-                mediaFormat.setInteger("max-output-channel-count", 2)
+                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 8)
+                mediaFormat.setInteger("max-output-channel-count", 8)
 
                 // 2. Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
