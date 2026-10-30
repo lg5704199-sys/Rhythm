@@ -12,12 +12,14 @@ import android.media.AudioManager
 import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.core.net.toUri
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
@@ -44,7 +46,7 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.DefaultAudioTrackBufferSizeProvider
+import androidx.media3.exoplayer.audio.ForwardingAudioSink
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
@@ -71,7 +73,6 @@ import chromahub.rhythm.app.shared.data.model.AppSettings
 import chromahub.rhythm.app.shared.data.model.TransitionSettings
 import chromahub.rhythm.app.util.calculateVolumeIn
 import chromahub.rhythm.app.util.calculateVolumeOut
-import chromahub.rhythm.app.util.envelope
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
@@ -98,7 +99,6 @@ private const val DOLBY_TAG = "RhythmDolby"
 private const val GAPLESS_TAG = "RhythmGapless"
 private const val GAP_SILENCE_THRESHOLD = 16
 private const val GAP_MIN_LOG_MS = 3.0
-private const val DISCONTINUITY_THRESHOLD = 8000
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -164,7 +164,7 @@ class RhythmPlayerEngine(
 
         override fun onAudioInputFormatChanged(
             eventTime: AnalyticsListener.EventTime,
-            format: androidx.media3.common.Format,
+            format: Format,
             decoderReuseEvaluation: DecoderReuseEvaluation?
         ) {
             Log.d(GAPLESS_TAG, "player=A input format: mime=${format.sampleMimeType} sr=${format.sampleRate} ch=${format.channelCount} reuseResult=${decoderReuseEvaluation?.result}")
@@ -206,7 +206,7 @@ class RhythmPlayerEngine(
 
         override fun onAudioInputFormatChanged(
             eventTime: AnalyticsListener.EventTime,
-            format: androidx.media3.common.Format,
+            format: Format,
             decoderReuseEvaluation: DecoderReuseEvaluation?
         ) {
             Log.d(GAPLESS_TAG, "player=B input format: mime=${format.sampleMimeType} sr=${format.sampleRate} ch=${format.channelCount} reuseResult=${decoderReuseEvaluation?.result}")
@@ -577,6 +577,7 @@ class RhythmPlayerEngine(
                     out
                 )
 
+                val gaplessSink = audioSink as? GaplessAudioSink
                 val mcIndex = out.indexOfFirst { it is MediaCodecAudioRenderer }
                 if (mcIndex >= 0) {
                     out[mcIndex] = DolbyMediaCodecAudioRenderer(
@@ -587,7 +588,8 @@ class RhythmPlayerEngine(
                         eventHandler,
                         eventListener,
                         audioSink,
-                        dolbyGainProcessor
+                        dolbyGainProcessor,
+                        gaplessSink
                     )
                 }
 
@@ -603,7 +605,7 @@ class RhythmPlayerEngine(
                 context: Context,
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean
-            ): AudioSink? {
+            ): AudioSink {
                 val processors = mutableListOf<AudioProcessor>()
 
                 if (dolbyGainProcessor != null) {
@@ -656,11 +658,13 @@ class RhythmPlayerEngine(
                     }
                 }
 
-                return DefaultAudioSink.Builder(context)
+                val baseSink = DefaultAudioSink.Builder(context)
                     .setEnableFloatOutput(floatOutputPref)
                     .setEnableAudioOutputPlaybackParameters(true)
                     .setAudioProcessorChain(processorChain)
                     .build()
+
+                return GaplessAudioSink(baseSink, dolbyGainProcessor)
             }
         }.apply {
             val extensionMode = if (appSettings.decoderExtensionsEnabled.value) {
@@ -672,7 +676,6 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
-        // Permite que o hardware trate o fluxo com espacialização automática compatível
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
@@ -715,7 +718,6 @@ class RhythmPlayerEngine(
             }
         )
 
-        // Respeita as edit lists (elst) dos contentores MP4/M4A para gapless sem cortes de atraso/preenchimento
         val extractorsFactory = DefaultExtractorsFactory()
             .setConstantBitrateSeekingEnabled(true)
             .setConstantBitrateSeekingAlwaysEnabled(true)
@@ -1213,7 +1215,7 @@ class RhythmPlayerEngine(
         isReleased = true
     }
 
-    fun getCurrentAudioFormat(): androidx.media3.common.Format? =
+    fun getCurrentAudioFormat(): Format? =
         _currentEngineFormat.value?.format ?: (masterPlayer as? ExoPlayer)?.audioFormat
 
     fun getCurrentDecoderName(): String =
@@ -1221,15 +1223,50 @@ class RhythmPlayerEngine(
 }
 
 data class EngineAudioFormat(
-    val format: androidx.media3.common.Format,
+    val format: Format,
     val decoderName: String = "",
     val timestamp: Long = System.currentTimeMillis()
 )
 
 /**
- * Processador PCM de sinal Dolby Atmos com diagnóstico de gapless:
- * Mede silêncio digital e detecta saltos bruscos de amplitude (descontinuidade)
- * na junção entre buffers e faixas.
+ * AudioSink wrapper para bloquear chamadas espúrias de flush/discontinuity na troca
+ * gapless entre faixas Dolby com o mesmo formato.
+ */
+@OptIn(UnstableApi::class)
+private class GaplessAudioSink(
+    private val baseSink: AudioSink,
+    private val dolbyProcessor: DolbyGainAudioProcessor?
+) : ForwardingAudioSink(baseSink) {
+
+    @Volatile
+    var isSeamlessDolbyTransition: Boolean = false
+
+    override fun configure(
+        inputFormat: Format,
+        specifiedBufferSize: Int,
+        outputChannels: IntArray?
+    ) {
+        if (isSeamlessDolbyTransition) {
+            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado na transição contínua Dolby para evitar flush de 33ms!")
+            return
+        }
+        super.configure(inputFormat, specifiedBufferSize, outputChannels)
+    }
+
+    override fun handleDiscontinuity() {
+        if (isSeamlessDolbyTransition) {
+            Log.d(GAPLESS_TAG, "GaplessAudioSink: handleDiscontinuity() suprimido para preservar buffer contínuo!")
+            isSeamlessDolbyTransition = false
+            return
+        }
+        super.handleDiscontinuity()
+    }
+}
+
+/**
+ * Processador PCM de sinal Dolby Atmos.
+ * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) e suprime o esvaziamento
+ * de buffers durante transições gapless.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1237,48 +1274,28 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     @Volatile
     var isDolbyAtmos: Boolean = false
 
+    @Volatile
+    var suppressNextFlush: Boolean = false
+
     private var gapSampleRate = 48000
     private var gapChannels = 2
     private var silentFrames = 0L
-
-    private var lastSampleLeft: Int = 0
-    private var lastSampleRight: Int = 0
-    private var hasLastSample: Boolean = false
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
             gapSampleRate = inputAudioFormat.sampleRate
             gapChannels = inputAudioFormat.channelCount
             silentFrames = 0L
-            hasLastSample = false
             inputAudioFormat
         } else {
             AudioProcessor.AudioFormat.NOT_SET
         }
     }
 
-    private fun inspectPcm(inputBuffer: ByteBuffer) {
+    private fun measureSilence(inputBuffer: ByteBuffer) {
         val shorts = inputBuffer.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
         val channels = gapChannels.coerceAtLeast(1)
         val frames = shorts.remaining() / channels
-        if (frames == 0) return
-
-        // 1. Detectar salto brusco de amplitude na fronteira entre o buffer anterior e o atual
-        if (hasLastSample && channels >= 2) {
-            val firstL = shorts.get(0).toInt()
-            val firstR = shorts.get(1).toInt()
-            val diffL = kotlin.math.abs(firstL - lastSampleLeft)
-            val diffR = kotlin.math.abs(firstR - lastSampleRight)
-
-            if (diffL > DISCONTINUITY_THRESHOLD || diffR > DISCONTINUITY_THRESHOLD) {
-                Log.w(
-                    GAPLESS_TAG,
-                    "SALTO/DESCONTINUIDADE na junção! L: $lastSampleLeft -> $firstL (diff=$diffL), R: $lastSampleRight -> $firstR (diff=$diffR)"
-                )
-            }
-        }
-
-        // 2. Medir silêncio digital consecutivo
         for (f in 0 until frames) {
             var silent = true
             val base = f * channels
@@ -1300,42 +1317,38 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
                 silentFrames = 0L
             }
         }
-
-        // 3. Salvar última amostra do buffer para testar o próximo
-        if (channels >= 2) {
-            val lastFrameBase = (frames - 1) * channels
-            lastSampleLeft = shorts.get(lastFrameBase).toInt()
-            lastSampleRight = shorts.get(lastFrameBase + 1).toInt()
-            hasLastSample = true
-        }
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
-        inspectPcm(inputBuffer)
+        measureSilence(inputBuffer)
         val out = replaceOutputBuffer(remaining)
         out.put(inputBuffer)
         out.flip()
     }
 
     override fun onFlush() {
+        if (suppressNextFlush) {
+            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO com sucesso na emenda gapless!")
+            suppressNextFlush = false
+            return
+        }
         super.onFlush()
         Log.w(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() disparado pelo pipeline!")
     }
 
     override fun onReset() {
         super.onReset()
-        hasLastSample = false
         silentFrames = 0L
-        Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onReset() disparado")
+        suppressNextFlush = false
     }
 }
 
 /**
- * Renderizador MediaCodec configurado com os parâmetros idênticos aos do AMP:
- * O descodificador oficial c2.dolby renderiza nativamente os objetos em estéreo binaural com HRTF
- * para fones de ouvido (Device 8, DAX State 0, Virtualizer 1, Surround Decoder 1, Output Level -17, Profile -1).
+ * Renderizador MediaCodec com reforço contínuo do perfil Neutro (-1) em cada buffer
+ * de saída para evitar que o DolbyAtmosWrapper da Samsung sobrescreva para o perfil 0/2,
+ * e proteção contra flush no gapless.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1346,7 +1359,8 @@ private class DolbyMediaCodecAudioRenderer(
     eventHandler: Handler,
     eventListener: AudioRendererEventListener,
     audioSink: AudioSink,
-    private val dolbyGainProcessor: DolbyGainAudioProcessor?
+    private val dolbyGainProcessor: DolbyGainAudioProcessor?,
+    private val gaplessSink: GaplessAudioSink?
 ) : MediaCodecAudioRenderer(
     context,
     codecAdapterFactory,
@@ -1356,14 +1370,19 @@ private class DolbyMediaCodecAudioRenderer(
     eventListener,
     audioSink
 ) {
-    /**
-     * REUTILIZAÇÃO CONTÍNUA DO CODEC (GAPLESS NATIVO):
-     * Impede a destruição e reinicialização do descodificador C2 na troca de faixas Dolby compatíveis.
-     */
+    private val neutralEnforcementBundle = Bundle().apply {
+        putInt("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
+        putInt("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
+        putInt("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
+        putInt("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
+        putInt("vendor.dolby.dap.virtualizer.enable", 1)
+        putInt("vendor.dolby.dap.surround-decoder.enable", 1)
+    }
+
     override fun canReuseCodec(
         codecInfo: MediaCodecInfo,
-        oldFormat: androidx.media3.common.Format,
-        newFormat: androidx.media3.common.Format,
+        oldFormat: Format,
+        newFormat: Format,
         isSameType: Boolean
     ): DecoderReuseEvaluation {
         val oldMime = oldFormat.sampleMimeType.orEmpty().lowercase()
@@ -1375,6 +1394,9 @@ private class DolbyMediaCodecAudioRenderer(
 
         val canReuseDolby = (isOldEac3 && isNewEac3) || (isOldAc4 && isNewAc4)
         if (canReuseDolby && oldFormat.sampleRate == newFormat.sampleRate) {
+            dolbyGainProcessor?.suppressNextFlush = true
+            gaplessSink?.isSeamlessDolbyTransition = true
+
             return DecoderReuseEvaluation(
                 codecInfo.name,
                 oldFormat,
@@ -1383,18 +1405,44 @@ private class DolbyMediaCodecAudioRenderer(
                 0
             )
         }
-        val superResult = super.canReuseCodec(codecInfo, oldFormat, newFormat, isSameType)
-        Log.w(
-            GAPLESS_TAG,
-            "canReuseCodec fora do caminho Dolby: super=${superResult.result} " +
-                "old[mime=${oldFormat.sampleMimeType} codecs=${oldFormat.codecs} sr=${oldFormat.sampleRate} ch=${oldFormat.channelCount} br=${oldFormat.bitrate} maxIn=${oldFormat.maxInputSize}] " +
-                "new[mime=${newFormat.sampleMimeType} codecs=${newFormat.codecs} sr=${newFormat.sampleRate} ch=${newFormat.channelCount} br=${newFormat.bitrate} maxIn=${newFormat.maxInputSize}]"
+        return super.canReuseCodec(codecInfo, oldFormat, newFormat, isSameType)
+    }
+
+    override fun processOutputBuffer(
+        positionUs: Long,
+        elapsedRealtimeUs: Long,
+        codec: MediaCodecAdapter?,
+        buffer: ByteBuffer?,
+        bufferIndex: Int,
+        bufferFlags: Int,
+        sampleCount: Int,
+        bufferPresentationTimeUs: Long,
+        isDecodeOnlyBuffer: Boolean,
+        isLastBuffer: Boolean,
+        format: Format
+    ): Boolean {
+        if (dolbyGainProcessor?.isDolbyAtmos == true && codec != null) {
+            try {
+                codec.setParameters(neutralEnforcementBundle)
+            } catch (_: Exception) {}
+        }
+        return super.processOutputBuffer(
+            positionUs,
+            elapsedRealtimeUs,
+            codec,
+            buffer,
+            bufferIndex,
+            bufferFlags,
+            sampleCount,
+            bufferPresentationTimeUs,
+            isDecodeOnlyBuffer,
+            isLastBuffer,
+            format
         )
-        return superResult
     }
 
     override fun getMediaFormat(
-        format: androidx.media3.common.Format,
+        format: Format,
         codecMimeType: String,
         codecMaxInputSize: Int,
         codecOperatingRate: Float
@@ -1409,23 +1457,16 @@ private class DolbyMediaCodecAudioRenderer(
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
             try {
-                // 1. Saída estéreo binaural para fones
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
-
-                // 2. Dispositivo 8 = Auscultadores / Fones (Dispara o cálculo HRTF com processing mode 10 e hvm=2)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
-
-                // 3. ATIVA O MOTOR DE ESPACIALIZAÇÃO HRTF E O PROCESSADOR DE OBJETOS DENTRO DO CODEC C2
                 mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
                 mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
-
-                // 4. Parâmetros de referência Dolby internos
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
 
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo e Surround Decoder configurados com ganho nativo.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Neutro (-1) em reforço contínuo.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
@@ -1450,7 +1491,7 @@ private class NoDolbyCapabilities(private val base: RendererCapabilities) : Rend
         MimeTypes.AUDIO_AC4
     )
 
-    override fun supportsFormat(format: androidx.media3.common.Format): Int {
+    override fun supportsFormat(format: Format): Int {
         return if (format.sampleMimeType in blockedMimeTypes) {
             RendererCapabilities.create(C.FORMAT_UNSUPPORTED_TYPE)
         } else {
@@ -1459,7 +1500,7 @@ private class NoDolbyCapabilities(private val base: RendererCapabilities) : Rend
     }
 }
 
-private fun androidx.media3.common.Tracks.getFirstSelectedTrackFormatByType(trackType: Int): androidx.media3.common.Format? {
+private fun androidx.media3.common.Tracks.getFirstSelectedTrackFormatByType(trackType: Int): Format? {
     for (group in groups) {
         if (group.type == trackType && group.isSelected) {
             for (i in 0 until group.length) {
