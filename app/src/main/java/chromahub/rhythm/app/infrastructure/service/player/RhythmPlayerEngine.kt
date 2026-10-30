@@ -93,7 +93,8 @@ import kotlinx.coroutines.runBlocking
 private const val DOLBY_ACTIVE_DEVICE_HEADPHONE = 8
 private const val DOLBY_DAX_STATE_INTERNAL = 0
 private const val DOLBY_OUTPUT_LEVEL_REF = -17
-private const val DOLBY_PROFILE_NEUTRAL = -1
+// Perfil 6 (Game1): Único com virtualizador ativo, compressor e IEQ desativados no dax-default.xml
+private const val DOLBY_PROFILE_TARGET = 6
 private const val DOLBY_TAG = "RhythmDolby"
 private const val GAPLESS_TAG = "RhythmGapless"
 private const val GAP_SILENCE_THRESHOLD = 16
@@ -1239,6 +1240,8 @@ private class GaplessAudioSink(
 
     @Volatile
     var isSeamlessDolbyTransition: Boolean = false
+    @Volatile
+    var suppressFlushUntilMs: Long = 0L
     private var transitionBufferCount = 0
 
     override fun configure(
@@ -1246,7 +1249,7 @@ private class GaplessAudioSink(
         specifiedBufferSize: Int,
         outputChannels: IntArray?
     ) {
-        if (isSeamlessDolbyTransition) {
+        if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
             Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado na transição contínua Dolby para evitar flush!")
             return
         }
@@ -1254,7 +1257,7 @@ private class GaplessAudioSink(
     }
 
     override fun handleDiscontinuity() {
-        if (isSeamlessDolbyTransition) {
+        if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
             Log.d(GAPLESS_TAG, "GaplessAudioSink: handleDiscontinuity() suprimido para preservar buffer contínuo!")
             return
         }
@@ -1262,7 +1265,7 @@ private class GaplessAudioSink(
     }
 
     override fun flush() {
-        if (isSeamlessDolbyTransition) {
+        if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
             Log.d(GAPLESS_TAG, "GaplessAudioSink: flush() suprimido durante a troca contínua!")
             return
         }
@@ -1277,7 +1280,7 @@ private class GaplessAudioSink(
         val result = baseSink.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
         if (isSeamlessDolbyTransition) {
             transitionBufferCount++
-            if (transitionBufferCount > 8) {
+            if (transitionBufferCount > 20 && System.currentTimeMillis() >= suppressFlushUntilMs) {
                 isSeamlessDolbyTransition = false
                 transitionBufferCount = 0
             }
@@ -1287,7 +1290,7 @@ private class GaplessAudioSink(
 }
 
 /**
- * Processador PCM de sinal Dolby Atmos com supressão de esvaziamento em gapless.
+ * Processador PCM de sinal Dolby Atmos com janela de supressão temporal para flush gapless.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1296,7 +1299,7 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     var isDolbyAtmos: Boolean = false
 
     @Volatile
-    var suppressNextFlush: Boolean = false
+    var suppressFlushUntilMs: Long = 0L
 
     private var gapSampleRate = 48000
     private var gapChannels = 2
@@ -1350,9 +1353,9 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     }
 
     override fun onFlush() {
-        if (suppressNextFlush) {
-            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO com sucesso na emenda gapless!")
-            suppressNextFlush = false
+        val now = System.currentTimeMillis()
+        if (now < suppressFlushUntilMs) {
+            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO pela janela de tempo gapless (${suppressFlushUntilMs - now}ms restantes)!")
             return
         }
         super.onFlush()
@@ -1362,14 +1365,14 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     override fun onReset() {
         super.onReset()
         silentFrames = 0L
-        suppressNextFlush = false
+        suppressFlushUntilMs = 0L
     }
 }
 
 /**
- * Renderizador MediaCodec com reforço contínuo do perfil Neutro (-1) em cada buffer
- * de saída para impedir que o sistema sobrescreva com os perfis 0/2 do DAX,
- * e proteção de buffer na troca gapless.
+ * Renderizador MediaCodec com reforço contínuo do perfil Game1 (6) em cada buffer
+ * de saída para impedir compressão de dinâmica e IEQ do DAX,
+ * com proteção estendida por janela de tempo na troca gapless.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1391,13 +1394,19 @@ private class DolbyMediaCodecAudioRenderer(
     eventListener,
     audioSink
 ) {
+    // Força o Perfil 6 (Game1) com volume-leveler e IEQ desativados para preservar a faixa dinâmica natural
     private val neutralEnforcementBundle = Bundle().apply {
         putInt("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
         putInt("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
-        putInt("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
+        putInt("vendor.dolby.profile-index.value", DOLBY_PROFILE_TARGET)
         putInt("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
         putInt("vendor.dolby.dap.virtualizer.enable", 1)
         putInt("vendor.dolby.dap.surround-decoder.enable", 1)
+        putInt("vendor.dolby.dap.volume-leveler.enable", 0)
+        putInt("vendor.dolby.dap.ieq.enable", 0)
+        putInt("vendor.dolby.dap.dialog-enhancer.enable", 0)
+        putInt("vendor.dolby.dap.bass-enhancer.enable", 0)
+        putInt("vendor.dolby.dap.graphic-equalizer.enable", 0)
     }
 
     override fun canReuseCodec(
@@ -1415,7 +1424,9 @@ private class DolbyMediaCodecAudioRenderer(
 
         val canReuseDolby = (isOldEac3 && isNewEac3) || (isOldAc4 && isNewAc4)
         if (canReuseDolby && oldFormat.sampleRate == newFormat.sampleRate) {
-            dolbyGainProcessor?.suppressNextFlush = true
+            val windowEnd = System.currentTimeMillis() + 500L
+            dolbyGainProcessor?.suppressFlushUntilMs = windowEnd
+            gaplessSink?.suppressFlushUntilMs = windowEnd
             gaplessSink?.isSeamlessDolbyTransition = true
 
             return DecoderReuseEvaluation(
@@ -1483,11 +1494,16 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
                 mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
                 mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
+                mediaFormat.setInteger("vendor.dolby.dap.volume-leveler.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.ieq.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.dialog-enhancer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.bass-enhancer.enable", 0)
+                mediaFormat.setInteger("vendor.dolby.dap.graphic-equalizer.enable", 0)
                 mediaFormat.setInteger("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
                 mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
-                mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
+                mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_TARGET)
 
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Neutro (-1) em reforço contínuo.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Game1 (6) com Dinâmica Total e sem compressão.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
