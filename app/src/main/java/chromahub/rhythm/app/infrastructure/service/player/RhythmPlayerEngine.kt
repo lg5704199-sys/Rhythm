@@ -113,11 +113,8 @@ class RhythmPlayerEngine(
 
     private var scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var transitionJob: Job? = null
-    private var dolbyWatcherJob: Job? = null
     @Volatile
     private var transitionRunning = false
-    @Volatile
-    private var isPlayerPlaying = false
 
     private lateinit var playerA: ExoPlayer
     private lateinit var playerB: ExoPlayer
@@ -262,15 +259,6 @@ class RhythmPlayerEngine(
     }
 
     private val masterPlayerListener = object : Player.Listener {
-        override fun onIsPlayingChanged(isPlaying: Boolean) {
-            isPlayerPlaying = isPlaying
-            if (isPlaying && activeDolbyGainProcessor?.isDolbyAtmos == true) {
-                startDolbyWatcher()
-            } else if (!isPlaying) {
-                stopDolbyWatcher()
-            }
-        }
-
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             if (playWhenReady) {
                 requestAudioFocus()
@@ -278,7 +266,6 @@ class RhythmPlayerEngine(
                     playerB.playWhenReady = true
                 }
             } else {
-                stopDolbyWatcher()
                 if (transitionRunning && ::playerB.isInitialized) {
                     playerB.playWhenReady = false
                 }
@@ -303,9 +290,7 @@ class RhythmPlayerEngine(
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
-                    if (isPlayerPlaying) startDolbyWatcher()
                 } else {
-                    stopDolbyWatcher()
                     val info = ReplayGainUtil.parse(format)
                     masterPlayer.currentMediaItem?.mediaId?.let { id ->
                         ReplayGainCache.put(id, info)
@@ -326,32 +311,6 @@ class RhythmPlayerEngine(
                 userVolume = volume
             }
         }
-    }
-
-    /**
-     * Sentinela desacoplada da thread do ExoPlayer:
-     * Monitora o driver da Samsung a cada 250ms e força o Perfil 6 caso o sistema tente injetar o Perfil 0 ou 2.
-     */
-    private fun startDolbyWatcher() {
-        if (dolbyWatcherJob?.isActive == true) return
-        dolbyWatcherJob = scope.launch(Dispatchers.IO) {
-            while (isActive) {
-                if (isPlayerPlaying && activeDolbyGainProcessor?.isDolbyAtmos == true) {
-                    try {
-                        val currentSys = audioManager.getParameters("g_effect_dolby_profile;g_effect_dolby_enable")
-                        if (currentSys.contains("g_effect_dolby_profile=0") || currentSys.contains("g_effect_dolby_profile=2")) {
-                            audioManager.setParameters("g_effect_dolby_profile=6")
-                        }
-                    } catch (_: Exception) {}
-                }
-                delay(250)
-            }
-        }
-    }
-
-    private fun stopDolbyWatcher() {
-        dolbyWatcherJob?.cancel()
-        dolbyWatcherJob = null
     }
 
     fun setUserVolume(volume: Float) {
@@ -717,10 +676,12 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
+        // C.SPATIALIZATION_BEHAVIOR_NEVER impede que o sistema operacional e o SoundAlive
+        // tentem espacialize um fluxo que o decodificador C2 já renderizou em HRTF binaural puro.
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
-            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_AUTO)
+            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_NEVER)
             .setAllowedCapturePolicy(C.ALLOW_CAPTURE_BY_NONE)
             .build()
 
@@ -988,9 +949,7 @@ class RhythmPlayerEngine(
 
         if (isDolby) {
             incomingReplayGain.setMode(ReplayGainUtil.Mode.None, false)
-            if (isPlayerPlaying) startDolbyWatcher()
         } else {
-            stopDolbyWatcher()
             val cachedTags = ReplayGainCache.get(mediaIdToSync)
             if (cachedTags != null) {
                 incomingReplayGain.setTags(cachedTags)
@@ -1243,7 +1202,6 @@ class RhythmPlayerEngine(
 
     fun release() {
         setPauseAtEndOfMediaItems(false)
-        stopDolbyWatcher()
         transitionJob?.cancel()
         scope.cancel()
         abandonAudioFocus()
@@ -1273,8 +1231,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * AudioSink wrapper baseado em delegação pura de interface para bloquear
- * chamadas espúrias de flush/discontinuity na troca gapless de faixas Dolby.
+ * AudioSink wrapper baseado em delegação pura de interface:
+ * Bloqueia o flush e configure que limpam buffers de hardware durante o gapless,
+ * mas PERMITE que handleDiscontinuity() alinhe os timestamps perfeitamente sem folga de 5ms.
  */
 @OptIn(UnstableApi::class)
 private class GaplessAudioSink(
@@ -1286,7 +1245,6 @@ private class GaplessAudioSink(
     var isSeamlessDolbyTransition: Boolean = false
     @Volatile
     var suppressFlushUntilMs: Long = 0L
-    private var transitionBufferCount = 0
 
     override fun configure(
         inputFormat: Format,
@@ -1294,18 +1252,10 @@ private class GaplessAudioSink(
         outputChannels: IntArray?
     ) {
         if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
-            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado na transição contínua Dolby para evitar flush!")
+            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado para manter AudioTrack contínuo!")
             return
         }
         baseSink.configure(inputFormat, specifiedBufferSize, outputChannels)
-    }
-
-    override fun handleDiscontinuity() {
-        if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
-            Log.d(GAPLESS_TAG, "GaplessAudioSink: handleDiscontinuity() suprimido para preservar buffer contínuo!")
-            return
-        }
-        baseSink.handleDiscontinuity()
     }
 
     override fun flush() {
@@ -1314,22 +1264,6 @@ private class GaplessAudioSink(
             return
         }
         baseSink.flush()
-    }
-
-    override fun handleBuffer(
-        buffer: ByteBuffer,
-        presentationTimeUs: Long,
-        encodedAccessUnitCount: Int
-    ): Boolean {
-        val result = baseSink.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
-        if (isSeamlessDolbyTransition) {
-            transitionBufferCount++
-            if (transitionBufferCount > 25 && System.currentTimeMillis() >= suppressFlushUntilMs) {
-                isSeamlessDolbyTransition = false
-                transitionBufferCount = 0
-            }
-        }
-        return result
     }
 }
 
@@ -1399,7 +1333,7 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     override fun onFlush() {
         val now = System.currentTimeMillis()
         if (now < suppressFlushUntilMs) {
-            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO pela janela de tempo gapless (${suppressFlushUntilMs - now}ms restantes)!")
+            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO pela janela gapless (${suppressFlushUntilMs - now}ms restantes)!")
             return
         }
         super.onFlush()
@@ -1414,9 +1348,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec com reforço contínuo do perfil Game1 (6) em cada buffer
- * de saída para impedir compressão de dinâmica e IEQ do DAX,
- * com proteção estendida por janela de tempo na troca gapless.
+ * Renderizador MediaCodec com reforço do perfil Game1 (6) aplicado no início de cada faixa,
+ * sem sobrecarregar o binder a cada buffer, e protegendo o pipeline no gapless.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1438,7 +1371,9 @@ private class DolbyMediaCodecAudioRenderer(
     eventListener,
     audioSink
 ) {
-    // Força o Perfil 6 (Game1) com volume-leveler e IEQ desativados para preservar a faixa dinâmica natural
+    @Volatile
+    private var pendingDolbyConfigInjection: Boolean = true
+
     private val neutralEnforcementBundle = Bundle().apply {
         putInt("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
         putInt("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
@@ -1468,10 +1403,11 @@ private class DolbyMediaCodecAudioRenderer(
 
         val canReuseDolby = (isOldEac3 && isNewEac3) || (isOldAc4 && isNewAc4)
         if (canReuseDolby && oldFormat.sampleRate == newFormat.sampleRate) {
-            val windowEnd = System.currentTimeMillis() + 500L
+            val windowEnd = System.currentTimeMillis() + 400L
             dolbyGainProcessor?.suppressFlushUntilMs = windowEnd
             gaplessSink?.suppressFlushUntilMs = windowEnd
             gaplessSink?.isSeamlessDolbyTransition = true
+            pendingDolbyConfigInjection = true
 
             return DecoderReuseEvaluation(
                 codecInfo.name,
@@ -1497,9 +1433,11 @@ private class DolbyMediaCodecAudioRenderer(
         isLastBuffer: Boolean,
         format: Format
     ): Boolean {
-        if (dolbyGainProcessor?.isDolbyAtmos == true && codec != null) {
+        // Aplica os parâmetros cirurgicamente na entrada da faixa em vez de poluir o binder a cada 20ms
+        if (pendingDolbyConfigInjection && dolbyGainProcessor?.isDolbyAtmos == true && codec != null) {
             try {
                 codec.setParameters(neutralEnforcementBundle)
+                pendingDolbyConfigInjection = false
             } catch (_: Exception) {}
         }
         return super.processOutputBuffer(
@@ -1532,6 +1470,7 @@ private class DolbyMediaCodecAudioRenderer(
 
         if (isDolby) {
             dolbyGainProcessor?.isDolbyAtmos = true
+            pendingDolbyConfigInjection = true
             try {
                 mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
                 mediaFormat.setInteger("max-output-channel-count", 2)
