@@ -93,7 +93,7 @@ import kotlinx.coroutines.runBlocking
 private const val DOLBY_ACTIVE_DEVICE_HEADPHONE = 8
 private const val DOLBY_DAX_STATE_INTERNAL = 0
 private const val DOLBY_OUTPUT_LEVEL_REF = -17
-// Perfil 6 (Game1): Único com virtualizador ativo, compressor e IEQ desativados no dax-default.xml
+// Perfil 6 (Game1): No dax-default.xml é o único com virtualizador ativo, compressor desligado e sem IEQ
 private const val DOLBY_PROFILE_TARGET = 6
 private const val DOLBY_TAG = "RhythmDolby"
 private const val GAPLESS_TAG = "RhythmGapless"
@@ -113,6 +113,7 @@ class RhythmPlayerEngine(
 
     private var scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var transitionJob: Job? = null
+    private var dolbyWatcherJob: Job? = null
     @Volatile
     private var transitionRunning = false
 
@@ -262,10 +263,12 @@ class RhythmPlayerEngine(
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             if (playWhenReady) {
                 requestAudioFocus()
+                startDolbyWatcher()
                 if (transitionRunning && ::playerB.isInitialized && playerB.playbackState != Player.STATE_ENDED) {
                     playerB.playWhenReady = true
                 }
             } else {
+                stopDolbyWatcher()
                 if (transitionRunning && ::playerB.isInitialized) {
                     playerB.playWhenReady = false
                 }
@@ -290,7 +293,9 @@ class RhythmPlayerEngine(
 
                 if (isDolby) {
                     activeReplayGainProcessor?.setMode(ReplayGainUtil.Mode.None, false)
+                    startDolbyWatcher()
                 } else {
+                    stopDolbyWatcher()
                     val info = ReplayGainUtil.parse(format)
                     masterPlayer.currentMediaItem?.mediaId?.let { id ->
                         ReplayGainCache.put(id, info)
@@ -311,6 +316,33 @@ class RhythmPlayerEngine(
                 userVolume = volume
             }
         }
+    }
+
+    /**
+     * Sentinela ativa que impede que o SoundAlive mantenha o perfil 0 (compressor ativo)
+     * e garante que a cadeia de áudio do sistema opere sem compressão destrutiva.
+     */
+    private fun startDolbyWatcher() {
+        if (dolbyWatcherJob?.isActive == true) return
+        dolbyWatcherJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                if (activeDolbyGainProcessor?.isDolbyAtmos == true && masterPlayer.isPlaying) {
+                    try {
+                        val currentSys = audioManager.getParameters("g_effect_dolby_profile;g_effect_dolby_enable")
+                        // Se o sistema forçar perfil 0 ou 2 (compressor ativado), forçamos de volta o perfil limpo
+                        if (currentSys.contains("g_effect_dolby_profile=0") || currentSys.contains("g_effect_dolby_profile=2")) {
+                            audioManager.setParameters("g_effect_dolby_profile=6")
+                        }
+                    } catch (_: Exception) {}
+                }
+                delay(300)
+            }
+        }
+    }
+
+    private fun stopDolbyWatcher() {
+        dolbyWatcherJob?.cancel()
+        dolbyWatcherJob = null
     }
 
     fun setUserVolume(volume: Float) {
@@ -1200,6 +1232,7 @@ class RhythmPlayerEngine(
 
     fun release() {
         setPauseAtEndOfMediaItems(false)
+        stopDolbyWatcher()
         transitionJob?.cancel()
         scope.cancel()
         abandonAudioFocus()
@@ -1280,7 +1313,7 @@ private class GaplessAudioSink(
         val result = baseSink.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
         if (isSeamlessDolbyTransition) {
             transitionBufferCount++
-            if (transitionBufferCount > 20 && System.currentTimeMillis() >= suppressFlushUntilMs) {
+            if (transitionBufferCount > 25 && System.currentTimeMillis() >= suppressFlushUntilMs) {
                 isSeamlessDolbyTransition = false
                 transitionBufferCount = 0
             }
