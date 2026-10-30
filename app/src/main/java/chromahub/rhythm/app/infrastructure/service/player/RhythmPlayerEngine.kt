@@ -46,7 +46,6 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.audio.AudioRendererEventListener
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
-import androidx.media3.exoplayer.audio.ForwardingAudioSink
 import androidx.media3.exoplayer.audio.MediaCodecAudioRenderer
 import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
@@ -664,7 +663,7 @@ class RhythmPlayerEngine(
                     .setAudioProcessorChain(processorChain)
                     .build()
 
-                return GaplessAudioSink(baseSink, dolbyProcessor = dolbyGainProcessor)
+                return GaplessAudioSink(baseSink, dolbyGainProcessor)
             }
         }.apply {
             val extensionMode = if (appSettings.decoderExtensionsEnabled.value) {
@@ -1229,32 +1228,66 @@ data class EngineAudioFormat(
 )
 
 /**
- * AudioSink wrapper para bloquear chamadas espúrias de handleDiscontinuity na troca
- * gapless entre faixas Dolby com o mesmo formato.
+ * AudioSink wrapper baseado em delegação pura de interface para bloquear
+ * chamadas espúrias de flush/discontinuity na troca gapless de faixas Dolby.
  */
 @OptIn(UnstableApi::class)
 private class GaplessAudioSink(
     private val baseSink: AudioSink,
     private val dolbyProcessor: DolbyGainAudioProcessor?
-) : ForwardingAudioSink(baseSink) {
+) : AudioSink by baseSink {
 
     @Volatile
     var isSeamlessDolbyTransition: Boolean = false
+    private var transitionBufferCount = 0
+
+    override fun configure(
+        inputFormat: Format,
+        specifiedBufferSize: Int,
+        outputChannels: IntArray?
+    ) {
+        if (isSeamlessDolbyTransition) {
+            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado na transição contínua Dolby para evitar flush!")
+            return
+        }
+        baseSink.configure(inputFormat, specifiedBufferSize, outputChannels)
+    }
 
     override fun handleDiscontinuity() {
         if (isSeamlessDolbyTransition) {
             Log.d(GAPLESS_TAG, "GaplessAudioSink: handleDiscontinuity() suprimido para preservar buffer contínuo!")
-            isSeamlessDolbyTransition = false
             return
         }
-        super.handleDiscontinuity()
+        baseSink.handleDiscontinuity()
+    }
+
+    override fun flush() {
+        if (isSeamlessDolbyTransition) {
+            Log.d(GAPLESS_TAG, "GaplessAudioSink: flush() suprimido durante a troca contínua!")
+            return
+        }
+        baseSink.flush()
+    }
+
+    override fun handleBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int
+    ): Boolean {
+        val result = baseSink.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        if (isSeamlessDolbyTransition) {
+            transitionBufferCount++
+            if (transitionBufferCount > 8) {
+                isSeamlessDolbyTransition = false
+                transitionBufferCount = 0
+            }
+        }
+        return result
     }
 }
 
 /**
- * Processador PCM de sinal Dolby Atmos.
- * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) e suprime o esvaziamento
- * de buffers durante transições gapless.
+ * Processador PCM de sinal Dolby Atmos com supressão de esvaziamento em gapless.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1334,8 +1367,9 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec com reforço contínuo do perfil Neutro (-1) a cada pacote de saída
- * e proteção anticorte gapless.
+ * Renderizador MediaCodec com reforço contínuo do perfil Neutro (-1) em cada buffer
+ * de saída para impedir que o sistema sobrescreva com os perfis 0/2 do DAX,
+ * e proteção de buffer na troca gapless.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1453,7 +1487,7 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
 
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Neutro (-1) configurado.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Neutro (-1) em reforço contínuo.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
