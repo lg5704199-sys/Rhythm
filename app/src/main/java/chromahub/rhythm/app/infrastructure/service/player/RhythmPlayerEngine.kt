@@ -93,7 +93,7 @@ import kotlinx.coroutines.runBlocking
 private const val DOLBY_ACTIVE_DEVICE_HEADPHONE = 8
 private const val DOLBY_DAX_STATE_INTERNAL = 0
 private const val DOLBY_OUTPUT_LEVEL_REF = -17
-// Perfil 6 (Game1): Único com virtualizador ativo, compressor e IEQ desativados no dax-default.xml
+// Perfil 6 (Game1): No dax-default.xml é o único com virtualizador ativo, compressor e IEQ desligados
 private const val DOLBY_PROFILE_TARGET = 6
 private const val DOLBY_TAG = "RhythmDolby"
 private const val GAPLESS_TAG = "RhythmGapless"
@@ -676,12 +676,12 @@ class RhythmPlayerEngine(
             setMediaCodecSelector(mediaCodecSelector)
         }
 
-        // C.SPATIALIZATION_BEHAVIOR_NEVER impede que o sistema operacional e o SoundAlive
-        // tentem espacialize um fluxo que o decodificador C2 já renderizou em HRTF binaural puro.
+        // SPATIALIZATION_BEHAVIOR_AUTO permite que o Dap_Spatializer do sistema atue
+        // sobre os 6 canais decodificados e crie a renderização binaural completa no fone
         val audioAttributes = AudioAttributes.Builder()
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .setUsage(C.USAGE_MEDIA)
-            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_NEVER)
+            .setSpatializationBehavior(C.SPATIALIZATION_BEHAVIOR_AUTO)
             .setAllowedCapturePolicy(C.ALLOW_CAPTURE_BY_NONE)
             .build()
 
@@ -1231,9 +1231,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * AudioSink wrapper baseado em delegação pura de interface:
- * Bloqueia o flush e configure que limpam buffers de hardware durante o gapless,
- * mas PERMITE que handleDiscontinuity() alinhe os timestamps perfeitamente sem folga de 5ms.
+ * AudioSink wrapper baseado em delegação de interface:
+ * Bloqueia o flush e configure desnecessários durante a troca gapless,
+ * mas preserva os buffers contínuos para emenda direta.
  */
 @OptIn(UnstableApi::class)
 private class GaplessAudioSink(
@@ -1243,32 +1243,49 @@ private class GaplessAudioSink(
 
     @Volatile
     var isSeamlessDolbyTransition: Boolean = false
-    @Volatile
-    var suppressFlushUntilMs: Long = 0L
+    var transitionBufferCount: Int = 0
 
     override fun configure(
         inputFormat: Format,
         specifiedBufferSize: Int,
         outputChannels: IntArray?
     ) {
-        if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
-            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado para manter AudioTrack contínuo!")
+        if (isSeamlessDolbyTransition) {
+            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado na transição contínua para evitar reset do AudioTrack!")
             return
         }
         baseSink.configure(inputFormat, specifiedBufferSize, outputChannels)
     }
 
     override fun flush() {
-        if (isSeamlessDolbyTransition || System.currentTimeMillis() < suppressFlushUntilMs) {
+        if (isSeamlessDolbyTransition) {
             Log.d(GAPLESS_TAG, "GaplessAudioSink: flush() suprimido durante a troca contínua!")
             return
         }
         baseSink.flush()
     }
+
+    override fun handleBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int
+    ): Boolean {
+        val result = baseSink.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        if (isSeamlessDolbyTransition) {
+            transitionBufferCount++
+            if (transitionBufferCount > 35) {
+                isSeamlessDolbyTransition = false
+                transitionBufferCount = 0
+            }
+        }
+        return result
+    }
 }
 
 /**
- * Processador PCM de sinal Dolby Atmos com janela de supressão temporal para flush gapless.
+ * Processador PCM de sinal Dolby Atmos.
+ * Utiliza contador de eventos (em vez de tempo fixo) para absorver todas as chamadas
+ * espúrias de flush disparadas durante a virada da faixa.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1277,10 +1294,10 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     var isDolbyAtmos: Boolean = false
 
     @Volatile
-    var suppressFlushUntilMs: Long = 0L
+    var suppressFlushCount: Int = 0
 
     private var gapSampleRate = 48000
-    private var gapChannels = 2
+    private var gapChannels = 6
     private var silentFrames = 0L
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
@@ -1331,9 +1348,9 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     }
 
     override fun onFlush() {
-        val now = System.currentTimeMillis()
-        if (now < suppressFlushUntilMs) {
-            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO pela janela gapless (${suppressFlushUntilMs - now}ms restantes)!")
+        if (suppressFlushCount > 0) {
+            suppressFlushCount--
+            Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() BLOQUEADO na emenda gapless (restam $suppressFlushCount)!")
             return
         }
         super.onFlush()
@@ -1343,13 +1360,13 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     override fun onReset() {
         super.onReset()
         silentFrames = 0L
-        suppressFlushUntilMs = 0L
+        suppressFlushCount = 0
     }
 }
 
 /**
- * Renderizador MediaCodec com reforço do perfil Game1 (6) aplicado no início de cada faixa,
- * sem sobrecarregar o binder a cada buffer, e protegendo o pipeline no gapless.
+ * Renderizador MediaCodec com saída nativa de 6 canais (5.1) para ativar a matriz
+ * de mixagem Modo 10 do Dap_Spatializer da Samsung e renderização binaural completa nos fones.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1374,6 +1391,7 @@ private class DolbyMediaCodecAudioRenderer(
     @Volatile
     private var pendingDolbyConfigInjection: Boolean = true
 
+    // Parâmetros do Perfil 6 (Game1) com compressão e IEQ desligados
     private val neutralEnforcementBundle = Bundle().apply {
         putInt("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
         putInt("vendor.dolby.dax-state.value", DOLBY_DAX_STATE_INTERNAL)
@@ -1403,10 +1421,9 @@ private class DolbyMediaCodecAudioRenderer(
 
         val canReuseDolby = (isOldEac3 && isNewEac3) || (isOldAc4 && isNewAc4)
         if (canReuseDolby && oldFormat.sampleRate == newFormat.sampleRate) {
-            val windowEnd = System.currentTimeMillis() + 400L
-            dolbyGainProcessor?.suppressFlushUntilMs = windowEnd
-            gaplessSink?.suppressFlushUntilMs = windowEnd
+            dolbyGainProcessor?.suppressFlushCount = 6
             gaplessSink?.isSeamlessDolbyTransition = true
+            gaplessSink?.transitionBufferCount = 0
             pendingDolbyConfigInjection = true
 
             return DecoderReuseEvaluation(
@@ -1433,7 +1450,6 @@ private class DolbyMediaCodecAudioRenderer(
         isLastBuffer: Boolean,
         format: Format
     ): Boolean {
-        // Aplica os parâmetros cirurgicamente na entrada da faixa em vez de poluir o binder a cada 20ms
         if (pendingDolbyConfigInjection && dolbyGainProcessor?.isDolbyAtmos == true && codec != null) {
             try {
                 codec.setParameters(neutralEnforcementBundle)
@@ -1472,8 +1488,9 @@ private class DolbyMediaCodecAudioRenderer(
             dolbyGainProcessor?.isDolbyAtmos = true
             pendingDolbyConfigInjection = true
             try {
-                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 2)
-                mediaFormat.setInteger("max-output-channel-count", 2)
+                // Configuração para 6 canais (5.1) para ativar a matriz Mode 10 no DAP da Samsung
+                mediaFormat.setInteger(MediaFormat.KEY_MAX_OUTPUT_CHANNEL_COUNT, 6)
+                mediaFormat.setInteger("max-output-channel-count", 6)
                 mediaFormat.setInteger("vendor.dolby.active-device.value", DOLBY_ACTIVE_DEVICE_HEADPHONE)
                 mediaFormat.setInteger("vendor.dolby.dap.virtualizer.enable", 1)
                 mediaFormat.setInteger("vendor.dolby.dap.surround-decoder.enable", 1)
@@ -1486,7 +1503,7 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_TARGET)
 
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Game1 (6) com Dinâmica Total e sem compressão.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Saída 5.1 (6 canais) + HRTF Ativo + Perfil Game1 (6).")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
