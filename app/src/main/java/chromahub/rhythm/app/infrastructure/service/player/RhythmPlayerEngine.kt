@@ -664,7 +664,7 @@ class RhythmPlayerEngine(
                     .setAudioProcessorChain(processorChain)
                     .build()
 
-                return GaplessAudioSink(baseSink, dolbyGainProcessor)
+                return GaplessAudioSink(baseSink, dolbyProcessor = dolbyGainProcessor)
             }
         }.apply {
             val extensionMode = if (appSettings.decoderExtensionsEnabled.value) {
@@ -1229,7 +1229,7 @@ data class EngineAudioFormat(
 )
 
 /**
- * AudioSink wrapper para bloquear chamadas espúrias de flush/discontinuity na troca
+ * AudioSink wrapper para bloquear chamadas espúrias de handleDiscontinuity na troca
  * gapless entre faixas Dolby com o mesmo formato.
  */
 @OptIn(UnstableApi::class)
@@ -1240,18 +1240,6 @@ private class GaplessAudioSink(
 
     @Volatile
     var isSeamlessDolbyTransition: Boolean = false
-
-    override fun configure(
-        inputFormat: Format,
-        specifiedBufferSize: Int,
-        outputChannels: IntArray?
-    ) {
-        if (isSeamlessDolbyTransition) {
-            Log.d(GAPLESS_TAG, "GaplessAudioSink: configure() ignorado na transição contínua Dolby para evitar flush de 33ms!")
-            return
-        }
-        super.configure(inputFormat, specifiedBufferSize, outputChannels)
-    }
 
     override fun handleDiscontinuity() {
         if (isSeamlessDolbyTransition) {
@@ -1346,9 +1334,8 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
 }
 
 /**
- * Renderizador MediaCodec com reforço contínuo do perfil Neutro (-1) em cada buffer
- * de saída para evitar que o DolbyAtmosWrapper da Samsung sobrescreva para o perfil 0/2,
- * e proteção contra flush no gapless.
+ * Renderizador MediaCodec com reforço contínuo do perfil Neutro (-1) a cada pacote de saída
+ * e proteção anticorte gapless.
  */
 @OptIn(UnstableApi::class)
 private class DolbyMediaCodecAudioRenderer(
@@ -1466,7 +1453,7 @@ private class DolbyMediaCodecAudioRenderer(
                 mediaFormat.setInteger("vendor.dolby.output-level.value", DOLBY_OUTPUT_LEVEL_REF)
                 mediaFormat.setInteger("vendor.dolby.profile-index.value", DOLBY_PROFILE_NEUTRAL)
 
-                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Neutro (-1) em reforço contínuo.")
+                Log.d(DOLBY_TAG, "Dolby C2 Decoder: Modo Fone (Device 8) + HRTF Ativo + Perfil Neutro (-1) configurado.")
             } catch (e: Exception) {
                 Log.w(DOLBY_TAG, "Falha ao configurar parâmetros do MediaCodec", e)
             }
