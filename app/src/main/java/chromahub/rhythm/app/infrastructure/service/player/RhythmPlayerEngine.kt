@@ -98,6 +98,7 @@ private const val DOLBY_TAG = "RhythmDolby"
 private const val GAPLESS_TAG = "RhythmGapless"
 private const val GAP_SILENCE_THRESHOLD = 16
 private const val GAP_MIN_LOG_MS = 3.0
+private const val DISCONTINUITY_THRESHOLD = 8000
 
 @OptIn(UnstableApi::class)
 class RhythmPlayerEngine(
@@ -1226,9 +1227,9 @@ data class EngineAudioFormat(
 )
 
 /**
- * Processador PCM de sinal Dolby Atmos.
- * Mantém o sinal com ganho unitário puro (0 dB / bit-perfect) direto do descodificador C2,
- * sem atenuação artificial, preservando a dinâmica e a amplitude original da faixa.
+ * Processador PCM de sinal Dolby Atmos com diagnóstico de gapless:
+ * Mede silêncio digital e detecta saltos bruscos de amplitude (descontinuidade)
+ * na junção entre buffers e faixas.
  */
 @OptIn(UnstableApi::class)
 class DolbyGainAudioProcessor : BaseAudioProcessor() {
@@ -1240,23 +1241,44 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
     private var gapChannels = 2
     private var silentFrames = 0L
 
+    private var lastSampleLeft: Int = 0
+    private var lastSampleRight: Int = 0
+    private var hasLastSample: Boolean = false
+
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         return if (inputAudioFormat.encoding == C.ENCODING_PCM_16BIT) {
             gapSampleRate = inputAudioFormat.sampleRate
             gapChannels = inputAudioFormat.channelCount
             silentFrames = 0L
+            hasLastSample = false
             inputAudioFormat
         } else {
             AudioProcessor.AudioFormat.NOT_SET
         }
     }
 
-    // Mede, em milissegundos, cada trecho de silêncio digital que passa pelo processador.
-    // Só lê o áudio, não altera nada.
-    private fun measureSilence(inputBuffer: ByteBuffer) {
+    private fun inspectPcm(inputBuffer: ByteBuffer) {
         val shorts = inputBuffer.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
         val channels = gapChannels.coerceAtLeast(1)
         val frames = shorts.remaining() / channels
+        if (frames == 0) return
+
+        // 1. Detectar salto brusco de amplitude na fronteira entre o buffer anterior e o atual
+        if (hasLastSample && channels >= 2) {
+            val firstL = shorts.get(0).toInt()
+            val firstR = shorts.get(1).toInt()
+            val diffL = kotlin.math.abs(firstL - lastSampleLeft)
+            val diffR = kotlin.math.abs(firstR - lastSampleRight)
+
+            if (diffL > DISCONTINUITY_THRESHOLD || diffR > DISCONTINUITY_THRESHOLD) {
+                Log.w(
+                    GAPLESS_TAG,
+                    "SALTO/DESCONTINUIDADE na junção! L: $lastSampleLeft -> $firstL (diff=$diffL), R: $lastSampleRight -> $firstR (diff=$diffR)"
+                )
+            }
+        }
+
+        // 2. Medir silêncio digital consecutivo
         for (f in 0 until frames) {
             var silent = true
             val base = f * channels
@@ -1272,21 +1294,41 @@ class DolbyGainAudioProcessor : BaseAudioProcessor() {
                 if (silentFrames > 0) {
                     val ms = silentFrames * 1000.0 / gapSampleRate
                     if (ms >= GAP_MIN_LOG_MS) {
-                        Log.w(GAPLESS_TAG, "silencio de ${ms.roundToInt()} ms terminou (frames=$silentFrames sr=$gapSampleRate dolby=$isDolbyAtmos)")
+                        Log.w(GAPLESS_TAG, "Silêncio de ${ms.roundToInt()} ms terminou (frames=$silentFrames sr=$gapSampleRate dolby=$isDolbyAtmos)")
                     }
                 }
                 silentFrames = 0L
             }
+        }
+
+        // 3. Salvar última amostra do buffer para testar o próximo
+        if (channels >= 2) {
+            val lastFrameBase = (frames - 1) * channels
+            lastSampleLeft = shorts.get(lastFrameBase).toInt()
+            lastSampleRight = shorts.get(lastFrameBase + 1).toInt()
+            hasLastSample = true
         }
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
-        measureSilence(inputBuffer)
+        inspectPcm(inputBuffer)
         val out = replaceOutputBuffer(remaining)
         out.put(inputBuffer)
         out.flip()
+    }
+
+    override fun onFlush() {
+        super.onFlush()
+        Log.w(GAPLESS_TAG, "DolbyGainAudioProcessor.onFlush() disparado pelo pipeline!")
+    }
+
+    override fun onReset() {
+        super.onReset()
+        hasLastSample = false
+        silentFrames = 0L
+        Log.d(GAPLESS_TAG, "DolbyGainAudioProcessor.onReset() disparado")
     }
 }
 
